@@ -1,59 +1,37 @@
-"""
-Document Export Tool - Exports reports to DOCX format
-"""
-import os
-from docx import Document
+import base64
+import io
+from pydantic import BaseModel, Field
 from langchain.tools import tool
-from datetime import datetime
+from docx import Document
 
+class DocSection(BaseModel):
+    """Represents a single section of the report."""
+    heading: str = Field(description="The section title (e.g., 'Introduction')")
+    content: str = Field(description="The full text content for this section")
 
-@tool
-def export_to_docx(
-    title: str,
-    summary: str,
-    sections: str,
-    output_dir: str = "./reports"
-) -> str:
-    """
-    Export a research report to DOCX format.
+class ExportInput(BaseModel):
+    """Input schema for the DOCX export tool."""
+    sections: list[DocSection] = Field(description="A list of section objects")
+    filename: str = Field(description="The output filename, e.g., 'report.docx'")
+
+@tool(args_schema=ExportInput)
+def export_to_docx(sections: list[DocSection], filename: str) -> str:
+    """Exports structured report sections to a professional .docx file."""
+    # Strip leading slashes to prevent issues
+    clean_filename = filename.lstrip("/\\")
     
-    Args:
-        title: The report title
-        summary: Executive summary paragraph
-        sections: Section content in format "Heading1::Content1|||Heading2::Content2"
-        output_dir: Directory to save the file (default: ./reports)
-    
-    Returns:
-        Path to the generated DOCX file
-    """
-    # Ensure output directory exists
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Create document
     doc = Document()
-    doc.add_heading(title, level=0)
+    for section in sections:
+        doc.add_heading(section.heading, level=1)
+        doc.add_paragraph(section.content)
     
-    # Add executive summary
-    doc.add_heading("Executive Summary", level=1)
-    doc.add_paragraph(summary)
+    # Save to in-memory buffer instead of disk
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
     
-    # Parse and add sections
-    if sections:
-        section_list = sections.split("|||")
-        for section in section_list:
-            if "::" in section:
-                heading, content = section.split("::", 1)
-                doc.add_heading(heading.strip(), level=1)
-                doc.add_paragraph(content.strip())
+    # Encode as base64 for transmission to frontend
+    doc_base64 = base64.b64encode(buffer.read()).decode('utf-8')
     
-    # Generate filename with timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()
-    safe_title = safe_title[:50]  # Limit filename length
-    filename = f"{safe_title}_{timestamp}.docx"
-    output_path = os.path.join(output_dir, filename)
-    
-    # Save document
-    doc.save(output_path)
-    
-    return f"Report saved to: {output_path}"
+    # Return marker with JSON data that frontend can parse
+    return f'[DOWNLOAD_DOCX]{{"filename": "{clean_filename}", "data": "{doc_base64}"}}'

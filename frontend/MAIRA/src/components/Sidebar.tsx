@@ -23,11 +23,10 @@ export const Sidebar = () => {
     };
 
     const handleDeleteThread = async (e: React.MouseEvent, threadId: string) => {
-        e.stopPropagation(); // Prevent selecting the thread
+        e.stopPropagation();
         await deleteThread(threadId);
     };
 
-    // Format date for display
     const formatDate = (dateStr: string) => {
         const date = new Date(dateStr);
         const now = new Date();
@@ -36,112 +35,145 @@ export const Sidebar = () => {
 
         if (diffDays === 0) return 'Today';
         if (diffDays === 1) return 'Yesterday';
-        if (diffDays < 7) return `${diffDays} days ago`;
-        return date.toLocaleDateString();
+        if (diffDays < 7) return `${diffDays}d ago`;
+        return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
     };
 
     return (
         <div
             className={cn(
-                "flex h-screen flex-col border-r border-neutral-800 bg-black transition-all duration-300",
-                collapsed ? "w-16" : "w-64"
+                "group/sidebar flex h-screen flex-col border-r border-white/5 bg-[#050505] transition-all duration-500 ease-in-out z-20 relative",
+                collapsed ? "w-[72px]" : "w-[280px]"
             )}
         >
-            <div className="flex items-center justify-between p-4">
+            {/* Glossy Overlay */}
+            <div className="absolute inset-0 bg-gradient-to-b from-blue-500/5 to-transparent pointer-events-none" />
+
+            <div className="flex items-center justify-between px-5 py-6">
                 {!collapsed && (
-                    <div className="flex items-center gap-2 font-bold text-xl text-white">
-                        <Shield className="h-6 w-6 text-blue-500" />
-                        <span>MAIRA</span>
+                    <div className="flex items-center gap-2.5 font-bold text-xl tracking-tight animate-fade-in">
+                        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-blue-600 shadow-lg shadow-blue-500/20">
+                            <Shield className="h-5 w-5 text-white" />
+                        </div>
+                        <span className="text-white">MAIRA</span>
+                        <span className="text-[10px] bg-white/10 text-white/50 px-1.5 py-0.5 rounded uppercase tracking-widest font-black">Pro</span>
                     </div>
                 )}
                 <button
                     onClick={() => setCollapsed(!collapsed)}
-                    className="rounded-lg p-2 text-neutral-400 hover:bg-neutral-800 hover:text-white"
+                    className={cn(
+                        "rounded-xl p-2 text-neutral-500 hover:bg-white/5 hover:text-white transition-all",
+                        collapsed && "mx-auto"
+                    )}
                 >
                     <Menu size={20} />
                 </button>
             </div>
 
-            <div className="p-2">
+            <div className="px-4 mb-4">
                 <button
                     onClick={handleNewChat}
                     className={cn(
-                        "flex w-full items-center gap-2 rounded-lg bg-blue-600 p-3 text-sm font-medium text-white transition-colors hover:bg-blue-700",
+                        "group relative flex w-full items-center gap-3 overflow-hidden rounded-xl bg-gradient-to-r from-blue-600 to-blue-500 p-3.5 text-sm font-semibold text-white transition-all hover:scale-[1.02] active:scale-[0.98] shadow-lg shadow-blue-500/10",
                         collapsed && "justify-center px-0"
                     )}
                 >
-                    <Plus size={20} />
-                    {!collapsed && <span>New Chat</span>}
+                    <div className="absolute inset-0 bg-gradient-to-r from-white/20 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
+                    <Plus size={18} className="relative z-10" />
+                    {!collapsed && <span className="relative z-10 animate-fade-in">New Conversation</span>}
                 </button>
             </div>
 
-            <div className="flex-1 overflow-y-auto px-2 py-4">
-                <div className="mb-2 px-2 text-xs font-semibold text-neutral-500 uppercase tracking-wider">
-                    {!collapsed && "Recent Conversations"}
-                </div>
-
-                {isLoadingThreads ? (
-                    <div className="flex items-center justify-center py-4">
-                        <Loader2 className="h-5 w-5 animate-spin text-neutral-500" />
+            <div className="flex-1 overflow-y-auto px-3 scrollbar-hide py-2">
+                {!collapsed && (
+                    <div className="mb-4 px-3 flex items-center justify-between">
+                        <span className="text-[11px] font-bold text-neutral-500 uppercase tracking-[0.1em]">Recent Activity</span>
                     </div>
-                ) : threads.length === 0 ? (
-                    <div className="px-2 py-4 text-center text-sm text-neutral-500">
-                        {!collapsed && "No conversations yet"}
-                    </div>
-                ) : (
-                    threads.map((thread) => (
-                        <button
-                            key={thread.thread_id}
-                            onClick={() => handleSelectThread(thread.thread_id)}
-                            className={cn(
-                                "group flex w-full items-center gap-3 rounded-lg p-3 text-sm transition-all",
-                                collapsed && "justify-center",
-                                currentThreadId === thread.thread_id
-                                    ? "bg-neutral-800 text-white"
-                                    : "text-neutral-400 hover:bg-neutral-900 hover:text-white"
-                            )}
-                        >
-                            <MessageSquare size={18} className="flex-shrink-0" />
-                            {!collapsed && (
-                                <>
-                                    <div className="flex-1 min-w-0 text-left">
-                                        <div className="truncate">{thread.title}</div>
-                                        <div className="text-xs text-neutral-500 mt-0.5">
-                                            {formatDate(thread.updated_at)}
-                                        </div>
-                                    </div>
-                                    <button
-                                        onClick={(e) => handleDeleteThread(e, thread.thread_id)}
-                                        className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-red-500/20 hover:text-red-400 transition-all"
-                                        title="Delete conversation"
-                                    >
-                                        <Trash2 size={14} />
-                                    </button>
-                                </>
-                            )}
-                        </button>
-                    ))
                 )}
+
+                <div className="space-y-1">
+                    {isLoadingThreads ? (
+                        <div className="flex flex-col gap-2 px-3 py-4">
+                            {[1, 2, 3].map(i => (
+                                <div key={i} className="h-10 w-full animate-pulse rounded-lg bg-white/5" />
+                            ))}
+                        </div>
+                    ) : threads.length === 0 ? (
+                        <div className="px-3 py-8 text-center animate-fade-in">
+                            <div className="mx-auto mb-3 h-10 w-10 text-neutral-700">
+                                <MessageSquare size={40} strokeWidth={1} />
+                            </div>
+                            <p className="text-xs text-neutral-500">
+                                {!collapsed && "No conversations yet. Start one to begin your research."}
+                            </p>
+                        </div>
+                    ) : (
+                        threads.map((thread) => (
+                            <button
+                                key={thread.thread_id}
+                                onClick={() => handleSelectThread(thread.thread_id)}
+                                className={cn(
+                                    "group relative flex w-full items-center gap-3 rounded-xl p-3 text-sm transition-all duration-200",
+                                    collapsed && "justify-center",
+                                    currentThreadId === thread.thread_id
+                                        ? "bg-white/10 text-white shadow-sm ring-1 ring-white/10"
+                                        : "text-neutral-400 hover:bg-white/5 hover:text-white"
+                                )}
+                            >
+                                {currentThreadId === thread.thread_id && (
+                                    <div className="absolute left-0 top-1/2 -translate-y-1/2 h-6 w-1 rounded-r-full bg-blue-500" />
+                                )}
+
+                                <MessageSquare size={18} className={cn(
+                                    "flex-shrink-0 transition-colors",
+                                    currentThreadId === thread.thread_id ? "text-blue-400" : "group-hover:text-blue-400"
+                                )} />
+
+                                {!collapsed && (
+                                    <>
+                                        <div className="flex-1 min-w-0 text-left animate-fade-in">
+                                            <div className="truncate font-medium">{thread.title || 'Untitled Chat'}</div>
+                                            <div className="text-[10px] text-neutral-500 mt-0.5 font-medium">
+                                                {formatDate(thread.updated_at)}
+                                            </div>
+                                        </div>
+                                        <button
+                                            onClick={(e) => handleDeleteThread(e, thread.thread_id)}
+                                            className="opacity-0 group-hover:opacity-100 p-1.5 rounded-lg hover:bg-red-500/20 hover:text-red-400 transition-all active:scale-90"
+                                            title="Delete conversation"
+                                        >
+                                            <Trash2 size={14} />
+                                        </button>
+                                    </>
+                                )}
+                            </button>
+                        ))
+                    )}
+                </div>
             </div>
 
-            <div className="border-t border-neutral-800 p-2">
+            <div className="p-3 mt-auto space-y-1 border-t border-white/5 bg-black/40 backdrop-blur-md">
                 <button
                     className={cn(
-                        "flex w-full items-center gap-3 rounded-lg p-3 text-sm text-neutral-400 hover:bg-neutral-900 hover:text-white transition-all",
+                        "flex w-full items-center gap-3 rounded-xl p-3 text-xs font-semibold text-neutral-400 hover:bg-white/5 hover:text-white transition-all",
                         collapsed && "justify-center"
                     )}
                 >
-                    <History size={18} />
-                    {!collapsed && <span>History</span>}
+                    <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-neutral-800 text-neutral-400">
+                        <History size={16} />
+                    </div>
+                    {!collapsed && <span className="animate-fade-in">Archive</span>}
                 </button>
                 <button
                     className={cn(
-                        "flex w-full items-center gap-3 rounded-lg p-3 text-sm text-neutral-400 hover:bg-neutral-900 hover:text-white transition-all",
+                        "flex w-full items-center gap-3 rounded-xl p-3 text-xs font-semibold text-neutral-400 hover:bg-white/5 hover:text-white transition-all",
                         collapsed && "justify-center"
                     )}
                 >
-                    <Settings size={18} />
-                    {!collapsed && <span>Settings</span>}
+                    <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-neutral-800 text-neutral-400">
+                        <Settings size={16} />
+                    </div>
+                    {!collapsed && <span className="animate-fade-in">Settings</span>}
                 </button>
             </div>
         </div>

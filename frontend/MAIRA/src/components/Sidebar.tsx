@@ -1,9 +1,9 @@
-import { MessageSquare, Plus, Settings, History, Menu, Shield, Trash2, Loader2 } from "lucide-react";
+import { MessageSquare, Plus, Settings, History, Menu, Shield, Trash2 } from "lucide-react";
 import { cn } from "../lib/utils";
-import { useState } from "react";
+import { useState, memo } from "react";
 import { useThreads } from "../context/ThreadContext";
 
-export const Sidebar = () => {
+export const Sidebar = memo(() => {
     const [collapsed, setCollapsed] = useState(false);
     const {
         threads,
@@ -65,6 +65,7 @@ export const Sidebar = () => {
                         "rounded-xl p-2 text-neutral-500 hover:bg-white/5 hover:text-white transition-all",
                         collapsed && "mx-auto"
                     )}
+                    title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
                 >
                     <Menu size={20} />
                 </button>
@@ -77,6 +78,7 @@ export const Sidebar = () => {
                         "group relative flex w-full items-center gap-3 overflow-hidden rounded-xl bg-gradient-to-r from-blue-600 to-blue-500 p-3.5 text-sm font-semibold text-white transition-all hover:scale-[1.02] active:scale-[0.98] shadow-lg shadow-blue-500/10",
                         collapsed && "justify-center px-0"
                     )}
+                    title="New conversation"
                 >
                     <div className="absolute inset-0 bg-gradient-to-r from-white/20 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
                     <Plus size={18} className="relative z-10" />
@@ -178,5 +180,5 @@ export const Sidebar = () => {
             </div>
         </div>
     );
-};
+});
 

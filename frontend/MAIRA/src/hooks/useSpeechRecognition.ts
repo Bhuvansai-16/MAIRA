@@ -46,7 +46,7 @@ declare global {
     }
 }
 
-export const useSpeechRecognition = () => {
+export const useSpeechRecognition = (onFinalTranscript?: (text: string) => void) => {
     const [isListening, setIsListening] = useState(false);
     const [transcript, setTranscript] = useState('');
     const [finalTranscript, setFinalTranscript] = useState('');  // Only set when speech ends
@@ -85,6 +85,9 @@ export const useSpeechRecognition = () => {
                 // If we have final text, save it
                 if (finalText) {
                     setFinalTranscript(prev => prev + finalText);
+                    if (onFinalTranscript) {
+                        onFinalTranscript(finalText);
+                    }
                 }
             };
 

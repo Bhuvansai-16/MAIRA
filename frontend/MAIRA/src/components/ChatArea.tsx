@@ -1,16 +1,20 @@
 import { useState, useRef, useEffect } from "react";
-import { Send, Mic, MicOff, Paperclip, Sparkles, Shield } from "lucide-react";
+import { Send, Mic, MicOff, Paperclip, Sparkles, Shield, GitBranch } from "lucide-react";
 import { useSpeechRecognition } from "../hooks/useSpeechRecognition";
 import { MessageBubble } from "./MessageBubble";
+import { TimelineView } from "./TimelineView";
 import { cn } from "../lib/utils";
 import { useThreads } from "../context/ThreadContext";
 
 export const ChatArea = () => {
-    const { currentMessages, isLoading, sendMessage, currentThreadId, deepResearch, setDeepResearch } = useThreads();
+    const { currentMessages, isLoading, sendMessage, currentThreadId, deepResearch, setDeepResearch, editMessage } = useThreads();
     const [input, setInput] = useState("");
+    const [isTimelineOpen, setIsTimelineOpen] = useState(false);
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
-    const { isListening, finalTranscript, error: speechError, startListening, stopListening, hasRecognition } = useSpeechRecognition();
+    const { isListening, error: speechError, startListening, stopListening, hasRecognition } = useSpeechRecognition((text) => {
+        setInput(prev => prev + (prev ? ' ' : '') + text);
+    });
 
     // Show speech error if any
     useEffect(() => {
@@ -28,13 +32,6 @@ export const ChatArea = () => {
         scrollToBottom();
     }, [currentMessages]);
 
-    // Update input with final speech transcript (only when speech recognition ends)
-    useEffect(() => {
-        if (finalTranscript) {
-            setInput(prev => prev + (prev ? ' ' : '') + finalTranscript);
-        }
-    }, [finalTranscript]);
-
     const handleSend = async () => {
         if (!input.trim() || isLoading) return;
 
@@ -49,6 +46,9 @@ export const ChatArea = () => {
             handleSend();
         }
     };
+
+    // Toggle timeline view
+    const toggleTimeline = () => setIsTimelineOpen(prev => !prev);
 
     return (
         <div className="flex h-screen flex-1 flex-col bg-[#080808] relative overflow-hidden">
@@ -75,6 +75,16 @@ export const ChatArea = () => {
                 </div>
 
                 <div className="flex items-center gap-3">
+                    {currentThreadId && (
+                        <button
+                            onClick={toggleTimeline}
+                            className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/5 border border-white/10 text-neutral-400 hover:text-white hover:bg-white/10 transition-all"
+                            title="View conversation timeline"
+                        >
+                            <GitBranch size={14} />
+                            <span className="text-[10px] font-bold uppercase tracking-wider hidden sm:inline">Timeline</span>
+                        </button>
+                    )}
                     <div className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white/5 border border-white/10">
                         <div className="h-1 w-1 rounded-full bg-blue-400" />
                         <span className="text-[10px] font-bold text-neutral-400 uppercase tracking-wider">Mistral Large 2</span>
@@ -108,6 +118,7 @@ export const ChatArea = () => {
                                         key={suggestion}
                                         onClick={() => setInput(suggestion)}
                                         className="p-4 text-left text-xs font-semibold text-neutral-400 bg-white/5 border border-white/5 rounded-2xl hover:bg-white/10 hover:border-white/10 hover:text-white transition-all group"
+                                        title={`Ask about: ${suggestion}`}
                                     >
                                         <span className="flex items-center justify-between">
                                             {suggestion}
@@ -120,13 +131,21 @@ export const ChatArea = () => {
                     ) : (
                         <div className="flex flex-col gap-8">
                             {currentMessages.map((msg, index) => (
-                                <div key={index} className="animate-slide-up" style={{ animationDelay: `${index * 0.05}s` }}>
+                                <div 
+                                    key={msg.message_id || index} 
+                                    className="animate-slide-up"
+                                >
                                     <MessageBubble
                                         role={msg.role}
                                         content={msg.content}
                                         thought={msg.thought}
                                         status={msg.status}
                                         download={msg.download}
+                                        verification={msg.verification}
+                                        reasoning={msg.reasoning}
+                                        messageIndex={index}
+                                        onEdit={editMessage}
+                                        isStreaming={msg.type === 'streaming'}
                                     />
                                 </div>
                             ))}
@@ -137,6 +156,7 @@ export const ChatArea = () => {
                                         role="agent"
                                         content=""
                                         status="Thinking..."
+                                        isStreaming={true}
                                     />
                                 </div>
                             )}
@@ -154,7 +174,7 @@ export const ChatArea = () => {
                         <div className="absolute -inset-1 bg-gradient-to-r from-blue-600 to-purple-600 rounded-[28px] opacity-0 group-focus-within/input:opacity-10 transition-opacity blur-md" />
 
                         <div className="relative flex items-end gap-3 rounded-[24px] border border-white/10 bg-[#121212]/80 backdrop-blur-3xl p-4 shadow-[0_20px_50px_rgba(0,0,0,0.5)] focus-within:border-white/20 transition-all duration-300">
-                            <button className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl text-neutral-500 hover:bg-white/5 hover:text-white transition-all active:scale-90">
+                            <button className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl text-neutral-500 hover:bg-white/5 hover:text-white transition-all active:scale-90" title="Attach file">
                                 <Paperclip size={20} />
                             </button>
 
@@ -165,6 +185,7 @@ export const ChatArea = () => {
                                 placeholder="Message MAIRA..."
                                 className="max-h-[250px] min-h-[44px] w-full resize-none bg-transparent py-3 text-sm text-white placeholder-neutral-500 focus:outline-none font-medium leading-relaxed"
                                 rows={1}
+                                aria-label="Message input"
                             />
 
                             <div className="flex items-center gap-2 pb-1 pr-1">
@@ -177,7 +198,7 @@ export const ChatArea = () => {
                                                 ? "bg-red-500/10 text-red-500 animate-pulse ring-1 ring-red-500/20"
                                                 : "text-neutral-500 hover:bg-white/5 hover:text-white"
                                         )}
-                                        title="Voice input"
+                                        title={isListening ? "Stop listening" : "Voice input"}
                                     >
                                         {isListening ? <MicOff size={18} /> : <Mic size={18} />}
                                     </button>
@@ -191,6 +212,7 @@ export const ChatArea = () => {
                                             ? "bg-gradient-to-r from-purple-600 to-blue-600 text-white shadow-lg shadow-purple-500/20 hover:scale-105 active:scale-95"
                                             : "bg-white/5 text-neutral-500 hover:bg-white/10 hover:text-white"
                                     )}
+                                    title={deepResearch ? "Deep research enabled" : "Enable deep research"}
                                 >
                                     <Sparkles size={14} className={cn(deepResearch && "animate-pulse")} />
                                     <span className="hidden sm:inline">Deep Research</span>
@@ -205,6 +227,7 @@ export const ChatArea = () => {
                                             ? "bg-white text-black hover:scale-105 active:scale-95 shadow-lg shadow-white/5"
                                             : "bg-white/5 text-neutral-600 cursor-not-allowed"
                                     )}
+                                    title="Send message"
                                 >
                                     <Send size={18} />
                                 </button>
@@ -216,6 +239,12 @@ export const ChatArea = () => {
                     </p>
                 </div>
             </footer>
+
+            {/* Timeline Modal */}
+            <TimelineView 
+                isOpen={isTimelineOpen} 
+                onClose={() => setIsTimelineOpen(false)} 
+            />
         </div>
     );
 };

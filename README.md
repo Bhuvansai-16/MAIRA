@@ -77,11 +77,21 @@ pip install -r requirements.txt
 ```
 
 4. Create a `.env` file in the backend directory with your API keys:
-```env
-GOOGLE_API_KEY=your_google_api_key_here
-GROQ_API_KEY=your_groq_api_key_here
-# Add other required API keys
+```bash
+# Copy the example environment file
+cp .env.example .env
+
+# Then edit .env and fill in your actual API keys
 ```
+
+Required API keys (see `backend/.env.example` for full list):
+- `GOOGLE_API_KEY` - Google Gemini API key
+- `TAVILY_API_KEY` - Tavily search API key
+- `LANGCHAIN_API_KEY` - LangChain/LangSmith API key (optional, for tracing)
+- `GROQ_API_KEY` - Groq API key (optional, for alternative models)
+- `ANTHROPIC_API_KEY` - Anthropic API key (optional, for Claude models)
+
+⚠️ **Security Note**: Never commit your `.env` file with real API keys!
 
 5. Start the FastAPI server:
 ```bash

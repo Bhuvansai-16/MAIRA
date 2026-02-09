@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { GitBranch, Clock, ChevronRight, History, Loader2, GitFork } from 'lucide-react';
 import { cn } from '../lib/utils';
-import { useThreads } from '../context/ThreadContext';
+import { useThreads } from '../hooks/useThreads';
 
 interface TimelineViewProps {
     isOpen: boolean;

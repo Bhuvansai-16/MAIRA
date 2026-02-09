@@ -1,14 +1,35 @@
+"""
+Enhanced PDF Export Tool with Multi-Level Support
+Generates professional PDFs with level-appropriate formatting and styling
+"""
 import base64
 import io
 import re
+import threading
 from datetime import datetime
 from pydantic import BaseModel, Field
 from langchain.tools import tool
+
+# Thread-safe storage for download data from subagent tool calls
+# Keyed by thread ident so concurrent agent runs don't interfere
+_pending_downloads = {}
+_download_lock = threading.Lock()
+
+def _store_pending_download(data: dict):
+    """Store download data keyed by current thread ID."""
+    with _download_lock:
+        _pending_downloads[threading.current_thread().ident] = data
+
+def get_pending_download() -> dict | None:
+    """Retrieve and remove pending download data for the current thread."""
+    with _download_lock:
+        return _pending_downloads.pop(threading.current_thread().ident, None)
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, KeepTogether
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.units import inch
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
 
 class DocSection(BaseModel):
     heading: str = Field(description="Section title")
@@ -18,6 +39,105 @@ class PDFExportInput(BaseModel):
     sections: list[DocSection] = Field(description="List of report sections")
     filename: str = Field(default="MAIRA_Report.pdf", description="Output filename")
     report_title: str = Field(default="Research Report", description="Main title for cover")
+    report_level: str = Field(
+        default="student",
+        description="Report level: 'student', 'professor', or 'researcher'"
+    )
+
+
+def get_level_colors(report_level: str) -> dict:
+    """Get color scheme based on report level."""
+    color_schemes = {
+        "student": {
+            "title": colors.HexColor('#2980b9'),      # Friendly blue
+            "heading": colors.HexColor('#3498db'),    # Bright blue
+            "accent": colors.HexColor('#52A4DB'),
+            "table_header": colors.HexColor('#3498db'),
+            "table_alt": colors.HexColor('#ebf5fb')
+        },
+        "professor": {
+            "title": colors.HexColor('#2c3e50'),      # Professional dark
+            "heading": colors.HexColor('#34495e'),    # Slate
+            "accent": colors.HexColor('#455A64'),
+            "table_header": colors.HexColor('#34495e'),
+            "table_alt": colors.HexColor('#ecf0f1')
+        },
+        "researcher": {
+            "title": colors.HexColor('#1a1a1a'),      # Academic dark
+            "heading": colors.HexColor('#2d2d2d'),    # Almost black
+            "accent": colors.HexColor('#424242'),
+            "table_header": colors.HexColor('#2d2d2d'),
+            "table_alt": colors.HexColor('#f5f5f5')
+        }
+    }
+    return color_schemes.get(report_level, color_schemes["student"])
+
+
+def setup_level_styles(styles, report_level: str):
+    """Create level-specific paragraph styles."""
+    level_colors = get_level_colors(report_level)
+    
+    # Title style for cover page
+    styles.add(ParagraphStyle(
+        'CoverTitle',
+        parent=styles['Title'],
+        fontSize=32 if report_level == "student" else 28,
+        spaceAfter=30,
+        textColor=level_colors["title"],
+        alignment=TA_CENTER,
+        fontName='Helvetica-Bold'
+    ))
+    
+    # Subtitle style
+    styles.add(ParagraphStyle(
+        'CoverSubtitle',
+        parent=styles['Normal'],
+        fontSize=16,
+        spaceAfter=20,
+        textColor=level_colors["accent"],
+        alignment=TA_CENTER,
+        fontName='Helvetica-Oblique'
+    ))
+    
+    # Section heading style
+    styles.add(ParagraphStyle(
+        'SectionHeading',
+        parent=styles['Heading1'],
+        fontSize=16,
+        spaceBefore=24,
+        spaceAfter=12,
+        textColor=level_colors["heading"],
+        fontName='Helvetica-Bold'
+    ))
+    
+    # Body text style (level-appropriate)
+    if report_level == "student":
+        body_leading = 16  # More line spacing for readability
+        body_size = 11
+    elif report_level == "professor":
+        body_leading = 15
+        body_size = 11
+    else:  # researcher
+        body_leading = 14
+        body_size = 10
+    
+    styles.add(ParagraphStyle(
+        'LevelBody',
+        parent=styles['BodyText'],
+        fontSize=body_size,
+        leading=body_leading,
+        alignment=TA_JUSTIFY,
+        fontName='Helvetica'
+    ))
+    
+    # Bullet style
+    styles.add(ParagraphStyle(
+        'LevelBullet',
+        parent=styles['LevelBody'],
+        leftIndent=20,
+        bulletIndent=10,
+        spaceAfter=6
+    ))
 
 
 def parse_markdown_table(table_text: str) -> list[list[str]]:
@@ -32,8 +152,8 @@ def parse_markdown_table(table_text: str) -> list[list[str]]:
     table_data = []
     
     for line in lines:
-        # Skip separator lines (|---|---|)
-        if re.match(r'^\|[\s\-:]+\|$', line.replace(' ', '')):
+        # Skip separator lines (|---|---| etc.) - include | in char class for multi-column tables
+        if re.match(r'^\|[\s\-:|]+\|$', line.replace(' ', '')):
             continue
         
         # Parse data rows
@@ -45,14 +165,16 @@ def parse_markdown_table(table_text: str) -> list[list[str]]:
     return table_data
 
 
-def create_table_flowable(table_data: list[list[str]], styles) -> Table:
+def create_table_flowable(table_data: list[list[str]], styles, report_level: str) -> Table:
     """
-    Create a styled ReportLab Table from parsed table data.
+    Create a styled ReportLab Table from parsed table data with level-appropriate formatting.
     """
     if not table_data:
         return None
     
-    # Wrap cell content in Paragraphs for text wrapping
+    level_colors = get_level_colors(report_level)
+    
+    # Cell styles
     cell_style = ParagraphStyle(
         'TableCell',
         parent=styles['BodyText'],
@@ -63,34 +185,36 @@ def create_table_flowable(table_data: list[list[str]], styles) -> Table:
     header_style = ParagraphStyle(
         'TableHeader',
         parent=styles['BodyText'],
-        fontSize=9,
-        leading=11,
+        fontSize=10 if report_level == "student" else 9,
+        leading=12,
         textColor=colors.white,
         fontName='Helvetica-Bold'
     )
     
-    # Calculate column widths based on page width
+    # Calculate column widths
     num_cols = len(table_data[0]) if table_data else 1
     available_width = 6.5 * inch  # Account for margins
     col_width = available_width / num_cols
     
+    # Format data with Paragraphs for text wrapping
     formatted_data = []
     for row_idx, row in enumerate(table_data):
         formatted_row = []
         for cell in row:
-            # Use header style for first row, body style for rest
             style = header_style if row_idx == 0 else cell_style
-            # Truncate very long cells to prevent overflow
+            # Truncate very long cells
             cell_text = cell[:200] + '...' if len(cell) > 200 else cell
+            # Handle line breaks in cells
+            cell_text = cell_text.replace('\n', '<br/>')
             formatted_row.append(Paragraph(cell_text, style))
         formatted_data.append(formatted_row)
     
     table = Table(formatted_data, colWidths=[col_width] * num_cols)
     
-    # Professional table styling
+    # Level-specific table styling
     table_style = TableStyle([
         # Header row styling
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a365d')),  # Dark blue header
+        ('BACKGROUND', (0, 0), (-1, 0), level_colors["table_header"]),
         ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
         ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
         ('FONTSIZE', (0, 0), (-1, 0), 10),
@@ -106,11 +230,11 @@ def create_table_flowable(table_data: list[list[str]], styles) -> Table:
         ('BOTTOMPADDING', (0, 1), (-1, -1), 8),
         
         # Alternating row colors
-        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f0f4f8')]),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, level_colors["table_alt"]]),
         
         # Grid and borders
         ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cbd5e0')),
-        ('BOX', (0, 0), (-1, -1), 1, colors.HexColor('#1a365d')),
+        ('BOX', (0, 0), (-1, -1), 1, level_colors["table_header"]),
         
         # Alignment
         ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
@@ -121,99 +245,190 @@ def create_table_flowable(table_data: list[list[str]], styles) -> Table:
     return table
 
 
-def process_content_with_tables(content: str, styles) -> list:
+def process_markdown_formatting(text: str) -> str:
+    """Convert Markdown formatting to ReportLab HTML."""
+    # **bold** → <b>bold</b>
+    text = re.sub(r'\*\*([^\*]+)\*\*', r'<b>\1</b>', text)
+    # *italic* → <i>italic</i>
+    text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', text)
+    # [text](url) → <link href="url">text</link>
+    text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<link href="\2" color="blue">\1</link>', text)
+    return text
+
+
+def process_content_with_tables(content: str, styles, report_level: str) -> list:
     """
-    Process content that may contain Markdown tables.
+    Process content that may contain Markdown tables and formatting.
     Returns a list of flowables (Paragraphs and Tables).
     """
     flowables = []
     
-    # Regex to find Markdown tables
-    # Matches tables that start with | and have at least a header row and separator
-    table_pattern = r'(\|[^\n]+\|\n\|[\s\-:]+\|(?:\n\|[^\n]+\|)*)'
+    # More robust table detection: find tables by looking for header + separator pattern
+    # then greedily consume all following lines that look like table rows
+    lines = content.split('\n')
+    i = 0
     
-    # Split content by tables
-    parts = re.split(table_pattern, content, flags=re.MULTILINE)
-    
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
+    while i < len(lines):
+        line = lines[i].strip()
         
-        # Check if this part is a Markdown table
-        if part.startswith('|') and '|' in part and '\n' in part:
-            # Check for separator line (indicates it's a proper table)
-            if re.search(r'\|[\s\-:]+\|', part):
-                table_data = parse_markdown_table(part)
-                if table_data and len(table_data) > 1:  # At least header + 1 row
-                    table = create_table_flowable(table_data, styles)
-                    if table:
-                        flowables.append(Spacer(1, 12))
-                        flowables.append(table)
-                        flowables.append(Spacer(1, 12))
-                        continue
+        # Check if this could be the start of a table (line with | characters)
+        if line.startswith('|') and line.endswith('|') and line.count('|') >= 2:
+            # Look ahead for separator line
+            if i + 1 < len(lines):
+                next_line = lines[i + 1].strip()
+                # Check if it's a separator (|---|---|)
+                if re.match(r'^\|[\s\-:|]+\|$', next_line.replace(' ', '')):
+                    # Found a table! Collect all table rows
+                    table_lines = [line, next_line]
+                    j = i + 2
+                    while j < len(lines):
+                        row_line = lines[j].strip()
+                        # Continue if line starts with | (table row)
+                        if row_line.startswith('|'):
+                            # Ensure it ends with | or add it
+                            if not row_line.endswith('|'):
+                                row_line += ' |'
+                            table_lines.append(row_line)
+                            j += 1
+                        elif row_line == '':
+                            # Empty line might be part of table, check next
+                            j += 1
+                        else:
+                            # Non-table line, stop
+                            break
+                    
+                    # Parse and render the table
+                    table_text = '\n'.join(table_lines)
+                    table_data = parse_markdown_table(table_text)
+                    if table_data and len(table_data) > 1:
+                        table = create_table_flowable(table_data, styles, report_level)
+                        if table:
+                            flowables.append(Spacer(1, 12))
+                            flowables.append(table)
+                            flowables.append(Spacer(1, 12))
+                    
+                    i = j
+                    continue
         
-        # Regular paragraph content
-        paragraphs = [p.strip() for p in part.split('\n\n') if p.strip()]
-        for para in paragraphs:
-            # Clean up any remaining table-like syntax that wasn't matched
-            para = re.sub(r'\|', '', para)
-            formatted = para.replace('\n', '<br/>')
-            flowables.append(Paragraph(formatted, styles['BodyText']))
-            flowables.append(Spacer(1, 8))
+        # Not a table - process as regular content
+        if line:
+            # Handle bullet points
+            if line.startswith('- ') or line.startswith('• '):
+                para_text = line[2:]
+                para_text = process_markdown_formatting(para_text)
+                flowables.append(Paragraph('• ' + para_text, styles['LevelBullet']))
+            elif re.match(r'^\d+\.\s', line):
+                # Numbered list item
+                num_match = re.match(r'^(\d+)\.\s+(.*)', line)
+                if num_match:
+                    num = num_match.group(1)
+                    text = process_markdown_formatting(num_match.group(2))
+                    flowables.append(Paragraph(f'{num}. {text}', styles['LevelBullet']))
+            elif line.startswith('#'):
+                # Heading
+                heading_match = re.match(r'^(#+)\s*(.*)', line)
+                if heading_match:
+                    level = len(heading_match.group(1))
+                    text = heading_match.group(2)
+                    flowables.append(Paragraph(text, styles['SectionHeading']))
+            else:
+                # Regular paragraph
+                para_text = process_markdown_formatting(line)
+                flowables.append(Paragraph(para_text, styles['LevelBody']))
+            
+            flowables.append(Spacer(1, 4))
+        
+        i += 1
     
     return flowables
+
+
+def create_cover_page(report_title: str, report_level: str, styles) -> list:
+    """Create a professional cover page based on report level."""
+    cover = []
+    
+    # Vertical spacing
+    cover.append(Spacer(1, 2 * inch))
+    
+    # Title
+    cover.append(Paragraph(report_title, styles['CoverTitle']))
+    cover.append(Spacer(1, 0.5 * inch))
+    
+    # Subtitle based on level
+    level_subtitles = {
+        "student": "An Educational Guide",
+        "professor": "A Teaching Resource",
+        "researcher": "A Research Report"
+    }
+    subtitle = level_subtitles.get(report_level, "Report")
+    cover.append(Paragraph(subtitle, styles['CoverSubtitle']))
+    cover.append(Spacer(1, 0.3 * inch))
+    
+    # Date and generator
+    date_text = f"Generated: {datetime.now().strftime('%B %d, %Y')}"
+    cover.append(Paragraph(date_text, styles['Italic']))
+    cover.append(Spacer(1, 6))
+    cover.append(Paragraph("MAIRA Research Agent", styles['Italic']))
+    
+    # Page break
+    cover.append(PageBreak())
+    
+    return cover
 
 
 @tool(args_schema=PDFExportInput)
 def export_to_pdf(
     sections: list[DocSection],
     filename: str = "MAIRA_Report.pdf",
-    report_title: str = "Research Report"
+    report_title: str = "Research Report",
+    report_level: str = "student"
 ) -> str:
-    """Generates a professional PDF with Markdown table support and returns base64 for download."""
+    """
+    Generates a professional PDF with level-appropriate formatting and Markdown support.
+    
+    Report Levels:
+    - student: Educational, readable, friendly (blue theme, clear spacing)
+    - professor: Professional, organized, balanced (slate theme, structured)
+    - researcher: Formal, academic, publication-ready (dark theme, compact)
+    
+    Supports:
+    - Markdown tables with proper rendering
+    - **bold** and *italic* formatting
+    - [links](url) with clickable hyperlinks
+    - Bullet points and lists
+    - Level-specific color schemes and spacing
+    """
     clean_filename = filename.lstrip("/\\").replace(" ", "_")
     if not clean_filename.lower().endswith(".pdf"):
         clean_filename += ".pdf"
 
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter, topMargin=72, bottomMargin=72)
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=letter,
+        topMargin=72,
+        bottomMargin=72,
+        leftMargin=72,
+        rightMargin=72
+    )
+    
     story = []
     styles = getSampleStyleSheet()
     
-    # Custom styles
-    styles.add(ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Title'],
-        fontSize=28,
-        spaceAfter=20,
-        textColor=colors.HexColor('#1a365d')
-    ))
+    # Setup level-specific styles
+    setup_level_styles(styles, report_level)
     
-    styles.add(ParagraphStyle(
-        'CustomHeading',
-        parent=styles['Heading1'],
-        fontSize=16,
-        spaceBefore=20,
-        spaceAfter=12,
-        textColor=colors.HexColor('#2d3748')
-    ))
-
-    # Title Page
-    story.append(Spacer(1, 2 * inch))
-    story.append(Paragraph(report_title, styles['CustomTitle']))
-    story.append(Spacer(1, 48))
-    story.append(Paragraph(f"Generated: {datetime.now().strftime('%B %d, %Y')}", styles['Italic']))
-    story.append(Paragraph("MAIRA Research Agent", styles['Italic']))
-    story.append(PageBreak())
-
+    # Add cover page
+    story.extend(create_cover_page(report_title, report_level, styles))
+    
+    # Add sections
     for section in sections:
         # Section Heading
-        story.append(Paragraph(section.heading, styles['CustomHeading']))
+        story.append(Paragraph(section.heading, styles['SectionHeading']))
         story.append(Spacer(1, 12))
 
-        # Process content with table support
-        content_flowables = process_content_with_tables(section.content, styles)
+        # Process content with table and formatting support
+        content_flowables = process_content_with_tables(section.content, styles, report_level)
         story.extend(content_flowables)
         
         story.append(Spacer(1, 20))  # Section spacing
@@ -222,6 +437,11 @@ def export_to_pdf(
         doc.build(story)
         buffer.seek(0)
         pdf_base64 = base64.b64encode(buffer.read()).decode('utf-8')
-        return f'[DOWNLOAD_PDF]{{"filename": "{clean_filename}", "data": "{pdf_base64}"}}'
+        # Store download data for backend recovery (subagent tool outputs may not appear in main stream)
+        _store_pending_download({"filename": clean_filename, "data": pdf_base64})
+        # Use json.dumps for proper JSON escaping
+        import json
+        json_data = json.dumps({"filename": clean_filename, "data": pdf_base64}, ensure_ascii=True)
+        return f'[DOWNLOAD_PDF]{json_data}'
     except Exception as e:
         return f"PDF generation error: {str(e)}"

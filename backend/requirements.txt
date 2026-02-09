@@ -17,8 +17,15 @@ langgraph-checkpoint-postgres>=3.0.0
 psycopg[binary]>=3.2.0
 psycopg-pool>=3.2.0
 
+# LangGraph Store (Long-term Memory)
+langgraph-store-postgres>=0.1.0
+
 # Deep Agents Framework
 deepagents>=0.1.0
+
+# Vector Store (PGVector + Embeddings)
+langchain-postgres>=0.0.16
+langchain-google-genai>=2.0.10
 
 # Search and Web Tools
 tavily-python==0.5.0
@@ -34,6 +41,7 @@ aiohttp>=3.9.0
 python-docx==1.1.2
 reportlab==4.2.5
 pypdf2==3.0.1
+pypdf>=5.0.0
 
 # Utilities
 uuid7==0.1.0
@@ -41,3 +49,6 @@ python-multipart==0.0.20
 
 # AI/ML Models
 google-generativeai==0.8.3
+
+# GitHub Integration
+PyGithub>=2.1.0

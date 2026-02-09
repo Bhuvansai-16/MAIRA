@@ -1,10 +1,14 @@
-import { MessageSquare, Plus, Settings, History, Menu, Shield, Trash2 } from "lucide-react";
+import { MessageSquare, Plus, Settings, History, Menu, Shield, Trash2, LogOut, User } from "lucide-react";
 import { cn } from "../lib/utils";
 import { useState, memo } from "react";
-import { useThreads } from "../context/ThreadContext";
+import { useThreads } from "../hooks/useThreads";
+import { useAuth } from "../context/AuthContext";
+import { useNavigate } from "react-router-dom";
 
 export const Sidebar = memo(() => {
     const [collapsed, setCollapsed] = useState(false);
+    const { user, signOut } = useAuth();
+    const navigate = useNavigate();
     const {
         threads,
         currentThreadId,
@@ -27,6 +31,11 @@ export const Sidebar = memo(() => {
         await deleteThread(threadId);
     };
 
+    const handleSignOut = async () => {
+        await signOut();
+        navigate('/');
+    };
+
     const formatDate = (dateStr: string) => {
         const date = new Date(dateStr);
         const now = new Date();
@@ -37,6 +46,11 @@ export const Sidebar = memo(() => {
         if (diffDays === 1) return 'Yesterday';
         if (diffDays < 7) return `${diffDays}d ago`;
         return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    };
+
+    const cleanTitle = (title: string) => {
+        if (!title) return '';
+        return title.replace(/\[UPLOADED_FILES:.*?\]/g, '').trim();
     };
 
     return (
@@ -134,7 +148,7 @@ export const Sidebar = memo(() => {
                                 {!collapsed && (
                                     <>
                                         <div className="flex-1 min-w-0 text-left animate-fade-in">
-                                            <div className="truncate font-medium">{thread.title || 'Untitled Chat'}</div>
+                                            <div className="truncate font-medium">{cleanTitle(thread.title) || 'Untitled Chat'}</div>
                                             <div className="text-[10px] text-neutral-500 mt-0.5 font-medium">
                                                 {formatDate(thread.updated_at)}
                                             </div>
@@ -155,6 +169,36 @@ export const Sidebar = memo(() => {
             </div>
 
             <div className="p-3 mt-auto space-y-1 border-t border-white/5 bg-black/40 backdrop-blur-md">
+                {/* User Info */}
+                {user && (
+                    <div className={cn(
+                        "flex items-center gap-3 rounded-xl p-3 mb-2",
+                        collapsed && "justify-center"
+                    )}>
+                        {user.user_metadata?.avatar_url ? (
+                            <img 
+                                src={user.user_metadata.avatar_url} 
+                                alt="Avatar"
+                                className="h-8 w-8 rounded-lg object-cover"
+                            />
+                        ) : (
+                            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-violet-600/20 text-violet-400">
+                                <User size={16} />
+                            </div>
+                        )}
+                        {!collapsed && (
+                            <div className="flex-1 min-w-0 animate-fade-in">
+                                <div className="text-xs font-semibold text-white truncate">
+                                    {user.user_metadata?.full_name || user.user_metadata?.name || user.email?.split('@')[0]}
+                                </div>
+                                <div className="text-[10px] text-neutral-500 truncate">
+                                    {user.email}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                )}
+
                 <button
                     className={cn(
                         "flex w-full items-center gap-3 rounded-xl p-3 text-xs font-semibold text-neutral-400 hover:bg-white/5 hover:text-white transition-all",
@@ -176,6 +220,21 @@ export const Sidebar = memo(() => {
                         <Settings size={16} />
                     </div>
                     {!collapsed && <span className="animate-fade-in">Settings</span>}
+                </button>
+                
+                {/* Sign Out */}
+                <button
+                    onClick={handleSignOut}
+                    className={cn(
+                        "flex w-full items-center gap-3 rounded-xl p-3 text-xs font-semibold text-neutral-400 hover:bg-red-500/10 hover:text-red-400 transition-all",
+                        collapsed && "justify-center"
+                    )}
+                    title="Sign out"
+                >
+                    <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-neutral-800 text-neutral-400 group-hover:bg-red-500/20 group-hover:text-red-400">
+                        <LogOut size={16} />
+                    </div>
+                    {!collapsed && <span className="animate-fade-in">Sign Out</span>}
                 </button>
             </div>
         </div>

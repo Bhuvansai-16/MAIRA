@@ -11,7 +11,7 @@ from tools.verification_tools import (
 )
 from tools.searchtool import internet_search
 from tools.extracttool import extract_webpage
-from config import model1
+from config import subagent_model
 
 deep_reasoning_subagent = {
     "name": "deep-reasoning-agent",
@@ -150,5 +150,5 @@ Remember: You are the last line of defense before publication. Be meticulous!
         internet_search,
         extract_webpage
     ],
-    "model": model1
+    "model": subagent_model
 }

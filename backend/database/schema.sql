@@ -6,6 +6,7 @@
 
 -- Enable required extensions
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS "vector";  -- pgvector for embedding storage
 
 -- =====================================================
 -- UUID v7 Generation Function
@@ -369,6 +370,41 @@ SELECT
 FROM active_sessions s
 JOIN threads t ON s.thread_id = t.thread_id
 WHERE s.status = 'running' AND s.expires_at > NOW();
+
+-- =====================================================
+-- LONG-TERM MEMORY STORE (LangGraph Store)
+-- Persistent storage for agent memories across threads
+-- =====================================================
+-- NOTE: This table is auto-created by AsyncPostgresStore.setup()
+-- but we document it here for reference and manual setup if needed.
+
+CREATE TABLE IF NOT EXISTS store (
+    prefix TEXT NOT NULL,                       -- Namespace prefix (e.g., agent memory path)
+    key TEXT NOT NULL,                          -- Unique key within namespace
+    value JSONB NOT NULL,                       -- Stored content
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (prefix, key)
+);
+
+-- Index for efficient namespace queries
+CREATE INDEX IF NOT EXISTS idx_store_prefix ON store(prefix);
+CREATE INDEX IF NOT EXISTS idx_store_updated ON store(updated_at DESC);
+
+-- Trigger to auto-update updated_at
+CREATE OR REPLACE FUNCTION update_store_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trigger_store_updated_at ON store;
+CREATE TRIGGER trigger_store_updated_at
+    BEFORE UPDATE ON store
+    FOR EACH ROW
+    EXECUTE FUNCTION update_store_updated_at();
 
 -- =====================================================
 -- SAMPLE DATA (Optional - for testing)

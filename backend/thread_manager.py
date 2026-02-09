@@ -1,23 +1,12 @@
 """
 Thread Manager - UUID v7 based thread management for conversation history
-With SqliteSaver for persistent checkpoints and state history support.
+Uses PostgreSQL (Supabase) for persistent storage via LangGraph checkpoints.
 """
 import uuid
 import time
-import os
-import sqlite3
-import json
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass, field, asdict
-from contextlib import contextmanager
-
-# Database path for persistent storage
-DB_DIR = os.path.join(os.path.dirname(__file__), 'data')
-DB_PATH = os.path.join(DB_DIR, 'maira_threads.db')
-
-# Ensure data directory exists
-os.makedirs(DB_DIR, exist_ok=True)
 
 
 def generate_uuid_v7() -> str:
@@ -62,7 +51,8 @@ class Thread:
 class ThreadManager:
     """
     Manages conversation threads with UUID v7 identifiers.
-    Stores thread metadata in memory (can be extended to use database).
+    In-memory cache only - persistence handled by PostgreSQL checkpoints.
+    Thread metadata is reconstructed from checkpoint data on demand.
     """
     
     def __init__(self):
@@ -79,17 +69,17 @@ class ThreadManager:
         return thread
     
     def get_thread(self, thread_id: str) -> Optional[Thread]:
-        """Get a thread by ID"""
+        """Get a thread by ID from in-memory cache"""
         return self._threads.get(thread_id)
     
     def thread_exists(self, thread_id: str) -> bool:
-        """Check if a thread exists"""
+        """Check if a thread exists in memory"""
         return thread_id in self._threads
     
     def get_all_threads(self) -> List[Thread]:
         """Get all threads, sorted by creation time (newest first)"""
         threads = list(self._threads.values())
-        # UUID v7 is naturally sortable by time, so we can sort by thread_id
+        # UUID v7 is naturally sortable by time
         threads.sort(key=lambda t: t.thread_id, reverse=True)
         return threads
     
@@ -109,62 +99,14 @@ class ThreadManager:
         return thread
     
     def delete_thread(self, thread_id: str) -> bool:
-        """Delete a thread"""
+        """
+        Delete a thread from in-memory cache.
+        PostgreSQL deletion is handled separately in the API endpoint.
+        """
         if thread_id in self._threads:
             del self._threads[thread_id]
             return True
         return False
-    
-    def save_to_db(self):
-        """Persist threads to SQLite database"""
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS threads (
-                thread_id TEXT PRIMARY KEY,
-                title TEXT,
-                created_at TEXT,
-                updated_at TEXT,
-                parent_thread_id TEXT,
-                fork_checkpoint_id TEXT
-            )
-        ''')
-        for thread in self._threads.values():
-            cursor.execute('''
-                INSERT OR REPLACE INTO threads 
-                (thread_id, title, created_at, updated_at, parent_thread_id, fork_checkpoint_id)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (
-                thread.thread_id, 
-                thread.title, 
-                thread.created_at, 
-                thread.updated_at,
-                getattr(thread, 'parent_thread_id', None),
-                getattr(thread, 'fork_checkpoint_id', None)
-            ))
-        conn.commit()
-        conn.close()
-    
-    def load_from_db(self):
-        """Load threads from SQLite database"""
-        if not os.path.exists(DB_PATH):
-            return
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('SELECT name FROM sqlite_master WHERE type="table" AND name="threads"')
-        if not cursor.fetchone():
-            conn.close()
-            return
-        cursor.execute('SELECT thread_id, title, created_at, updated_at FROM threads')
-        for row in cursor.fetchall():
-            thread = Thread(
-                thread_id=row[0],
-                title=row[1],
-                created_at=row[2],
-                updated_at=row[3]
-            )
-            self._threads[thread.thread_id] = thread
-        conn.close()
     
     def create_branch(self, parent_thread_id: str, fork_checkpoint_id: str, title: Optional[str] = None) -> Optional[Thread]:
         """Create a new branch from an existing thread at a specific checkpoint"""
@@ -177,11 +119,10 @@ class ThreadManager:
             thread_id=thread_id,
             title=title or f"Branch of {parent.title}"
         )
-        # Store branch metadata
+        # Store branch metadata as dynamic attributes
         thread.parent_thread_id = parent_thread_id  # type: ignore
         thread.fork_checkpoint_id = fork_checkpoint_id  # type: ignore
         self._threads[thread_id] = thread
-        self.save_to_db()
         return thread
 
 
@@ -197,10 +138,6 @@ class CheckpointInfo:
     
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
-    
-    def thread_exists(self, thread_id: str) -> bool:
-        """Check if a thread exists"""
-        return thread_id in self._threads
 
 
 # Global thread manager instance

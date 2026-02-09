@@ -5,6 +5,7 @@ from .extracttool import extract_webpage
 from .arxivertool import arxiv_tool
 from .pdftool import export_to_pdf
 from .doctool import export_to_docx
+from .latextoformate import convert_latex_to_all_formats
 
 # Verification tools with Pydantic schemas for Gemini compatibility
 from .verification_tools import (
@@ -47,4 +48,5 @@ __all__ = [
     'SourceItem',
     # Helper
     'run_full_verification'
+    'convert_latex_to_all_formats'
 ]

@@ -5,6 +5,10 @@
 .env.production
 .env*.local
 
+# Private keys and certificates
+*.pem
+*.key
+
 # Python
 __pycache__/
 *.py[cod]

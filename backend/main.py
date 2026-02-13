@@ -139,6 +139,10 @@ class AgentRequest(BaseModel):
     persona: str = "default"
     parent_checkpoint_id: Optional[str] = None  # For branching from a specific checkpoint
     last_event_id: Optional[str] = None  # For stream reconnection
+    # Edit/versioning support
+    edit_group_id: Optional[str] = None  # Groups edited messages together (same logical message)
+    edit_version: Optional[int] = None  # Version number within the edit group
+    original_message_index: Optional[int] = None  # Original position in conversation
 
 
 class CreateThreadRequest(BaseModel):
@@ -887,7 +891,14 @@ def get_thread_messages(thread_id: str, request: Request):
         
         messages = []
         if state and state.values and "messages" in state.values:
-            for msg in state.values["messages"]:
+            print(f"📤 GET /threads/{thread_id}/messages - {len(state.values['messages'])} raw messages")
+            for idx, msg in enumerate(state.values["messages"]):
+                # Debug: Check raw message content for EDIT_META
+                raw_content = getattr(msg, 'content', '') if hasattr(msg, 'content') else str(msg)
+                has_edit_meta = 'EDIT_META' in (raw_content if isinstance(raw_content, str) else str(raw_content))
+                msg_type = getattr(msg, 'type', 'unknown')
+                print(f"   [{idx}] type={msg_type} hasEditMeta={has_edit_meta} content={str(raw_content)[:80]}...")
+                
                 msg_data = _serialize_message(msg)
                 if msg_data:
                     messages.append(msg_data)
@@ -1201,7 +1212,7 @@ def _stream_with_retry(agent, stream_input, config, thread_id, store_event):
             raise  # Non-transient or retries exhausted — propagate to caller
 
 
-def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_research: bool, literature_survey: bool = False, persona: str = "default"):
+def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_research: bool, literature_survey: bool = False, persona: str = "default", edit_metadata: Optional[dict] = None):
     """
     DETACHED BACKGROUND THREAD: Runs the agent independently of HTTP connection.
     This thread continues even if the browser reloads or disconnects.
@@ -1213,6 +1224,7 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
         config: Agent configuration
         deep_research: Whether deep research mode is enabled
         persona: The persona to adopt (Student, Professor, Researcher)
+        edit_metadata: Optional dict with edit_group_id, edit_version, original_message_index
     """
     import re
     import hashlib
@@ -1226,7 +1238,9 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
         'websearch-agent': {'start': '🌐 Searching the web...', 'complete': 'Web search complete'},
         'academic-paper-agent': {'start': '📚 Searching for research papers...', 'complete': 'Paper search complete'},
         'draft-subagent': {'start': '✍️ Drafting results...', 'complete': 'Draft complete'},
-        'deep-reasoning-agent': {'start': '🧠 Analyzing and verifying...', 'complete': 'Analysis complete'},
+        'validation-agent': {'start': '🔗 Validating citations...', 'complete': 'Citation validation complete'},
+        'fact-checking-agent': {'start': '✅ Fact-checking claims...', 'complete': 'Fact-check complete'},
+        'quality-checking-agent': {'start': '📋 Checking content quality...', 'complete': 'Quality check complete'},
         'report-subagent': {'start': '📄 Generating report...', 'complete': 'Report generated'},
         # Direct tools
         'internet_search': {'start': '🔍 Performing web search...', 'complete': 'Search complete'},
@@ -1279,6 +1293,7 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
         
         # Buffer to hold download events - sent AFTER all content to keep summary + download in sync
         buffered_download_event = None
+        download_marker_seen = False
         
         # Prefix message with mode indicator for agent routing
         # Also include persona context
@@ -1318,10 +1333,30 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
         except Exception as pool_err:
             print(f"⚠️ Pool pre-validation failed: {pool_err}")
         
+        # Build message input with edit metadata EMBEDDED in content (survives serialization)
+        # Format: [EDIT_META:{"g":"groupId","v":1,"i":0}] at the start of content
+        from langchain_core.messages import HumanMessage
+        import json as _json
+        
+        final_content = user_content
+        if edit_metadata:
+            # Embed edit metadata in content - this survives LangGraph checkpoint serialization
+            edit_meta_str = _json.dumps({
+                "g": edit_metadata.get("edit_group_id"),
+                "v": edit_metadata.get("edit_version"),
+                "i": edit_metadata.get("original_message_index")
+            })
+            final_content = f"[EDIT_META:{edit_meta_str}]{user_content}"
+            print(f"   ✏️ Edit mode: group={edit_metadata.get('edit_group_id')}, version={edit_metadata.get('edit_version')}")
+            print(f"   ✏️ Final content starts with: {final_content[:100]}...")
+        
+        message_input = HumanMessage(content=final_content)
+        print(f"   📝 HumanMessage content preview: {message_input.content[:120] if isinstance(message_input.content, str) else str(message_input.content)[:120]}...")
+        
         # Stream agent updates with automatic retry on transient DB/SSL errors
         for chunk in _stream_with_retry(
             agent,
-            {"messages": [{"role": "user", "content": user_content}]},
+            {"messages": [message_input]},
             config, thread_id, store_event
         ):
             # CHECK FOR CANCELLATION at the start of each chunk
@@ -1433,14 +1468,22 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
                                         json_str = content_to_check[json_start:json_end + 1]
                                         download_data = json.loads(json_str, strict=False)
                                         
-                                        # Buffer the download event - will be sent AFTER all content
-                                        # This ensures summary text arrives before the download button
-                                        buffered_download_event = {
-                                            "type": "download",
-                                            "filename": download_data.get("filename", "download"),
-                                            "data": download_data.get("data", "")
-                                        }
-                                        print(f"  📥 Download buffered from {msg_type}: {download_data.get('filename')} ({len(download_data.get('data', ''))} bytes)")
+                                        # Check if the JSON contains actual base64 data
+                                        # (latex tools now return short status JSON without data;
+                                        #  full data is stored via _store_pending_download)
+                                        if download_data.get("data"):
+                                            # Full inline data — buffer it directly
+                                            buffered_download_event = {
+                                                "type": "download",
+                                                "filename": download_data.get("filename", "download"),
+                                                "data": download_data["data"]
+                                            }
+                                            print(f"  📥 Download buffered from {msg_type}: {download_data.get('filename')} ({len(download_data['data'])} bytes)")
+                                        else:
+                                            # Short status JSON (no data) — will use fallback path
+                                            print(f"  📋 Download marker detected (status only): {download_data.get('filename')} — will recover from tool storage")
+                                            # Mark that we saw the marker so we know to look for it
+                                            download_marker_seen = True
                                     except (json.JSONDecodeError, ValueError, IndexError) as e:
                                         print(f"  ⚠️ Failed to parse download marker: {e}")
                         
@@ -1456,8 +1499,26 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
                                 store_event(status_event)
                                 print(f"  ✅ Tool complete: {msg_name}")
             
-            # Also serialize and send the regular update
+                # Also serialize and send the regular update
             serialized = _serialize_chunk(chunk)
+            if serialized:
+                # Defensive sanitization: strip any inline download markers and payloads
+                # from serialized messages. Inline base64 can be truncated by the LLM
+                # and should never be propagated to the frontend; tool-storage events
+                # are emitted later and contain the full data.
+                try:
+                    if isinstance(serialized.get('messages'), list):
+                        for m in serialized['messages']:
+                            c = m.get('content') if isinstance(m, dict) else None
+                            if isinstance(c, str) and ("[DOWNLOAD_PDF]" in c or "[DOWNLOAD_DOCX]" in c or "[DOWNLOAD_MD]" in c):
+                                # Remove the marker and any following JSON/base64 payload
+                                import re as _re
+                                cleaned = _re.sub(r'\[DOWNLOAD_[A-Z]+\].*$', '', c, flags=_re.DOTALL).strip()
+                                m['content'] = cleaned or 'Report generated successfully! Click below to download.'
+                                print(f"  🔒 Stripped inline download marker from serialized message (len before: {len(c)})")
+                except Exception as _san_e:
+                    print(f"  ⚠️ Failed to sanitize serialized message: {_san_e}")
+
             if serialized:
                 # Deduplicate: skip messages with content we've already sent
                 if serialized.get('messages'):
@@ -1501,27 +1562,51 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
         
         # Send buffered download event AFTER all content has been streamed
         # This ensures the summary text arrives before the download button
-        if not buffered_download_event:
-            # Fallback: check tool-level storage for subagent-generated downloads
-            # (SubAgentMiddleware encapsulates internal tool outputs, so markers
-            #  from export_to_pdf/export_to_docx may not appear in the main stream)
-            from tools.pdftool import get_pending_download as get_pdf_download
-            from tools.doctool import get_pending_download as get_docx_download
-            from tools.latextoformate import get_pending_download as get_latex_download
-            pending = get_pdf_download() or get_docx_download() or get_latex_download()
-            if pending:
-                buffered_download_event = {
-                    "type": "download",
-                    "filename": pending.get("filename", "download"),
-                    "data": pending.get("data", "")
-                }
-                print(f"  📥 Download recovered from tool storage: {buffered_download_event.get('filename')}")
+        # Collect ALL pending downloads (PDF, DOCX, LaTeX) - don't short-circuit!
+        from tools.pdftool import get_pending_download as get_pdf_download
+        from tools.doctool import get_pending_download as get_docx_download
+        from tools.latextoformate import get_pending_download as get_latex_download
         
+        all_downloads = []
         if buffered_download_event:
-            # Delay slightly so frontend renders summary text before showing download button
-            time.sleep(0.5)
-            store_event(buffered_download_event)
-            print(f"  📥 Download event sent (buffered): {buffered_download_event.get('filename')}")
+            all_downloads.append(buffered_download_event)
+        
+        # Check each tool's storage independently (no short-circuit)
+        pdf_pending = get_pdf_download()
+        if pdf_pending and pdf_pending.get("data"):
+            all_downloads.append({
+                "type": "download",
+                "filename": pdf_pending.get("filename", "download.pdf"),
+                "data": pdf_pending.get("data", "")
+            })
+            print(f"  📥 PDF recovered from tool storage: {pdf_pending.get('filename')} ({len(pdf_pending.get('data', ''))} bytes)")
+        
+        docx_pending = get_docx_download()
+        if docx_pending and docx_pending.get("data"):
+            all_downloads.append({
+                "type": "download",
+                "filename": docx_pending.get("filename", "download.docx"),
+                "data": docx_pending.get("data", "")
+            })
+            print(f"  📥 DOCX recovered from tool storage: {docx_pending.get('filename')} ({len(docx_pending.get('data', ''))} bytes)")
+        
+        latex_pending = get_latex_download()
+        if latex_pending and latex_pending.get("data"):
+            all_downloads.append({
+                "type": "download",
+                "filename": latex_pending.get("filename", "download"),
+                "data": latex_pending.get("data", "")
+            })
+            print(f"  📥 LaTeX recovered from tool storage: {latex_pending.get('filename')} ({len(latex_pending.get('data', ''))} bytes)")
+        
+        if not all_downloads and download_marker_seen:
+            print(f"  ⚠️ Download marker was seen in stream but no data found in tool storage")
+        
+        # Send all download events
+        for download_event in all_downloads:
+            time.sleep(0.3)  # Small delay between downloads
+            store_event(download_event)
+            print(f"  📥 Download event sent: {download_event.get('filename')}")
         
         # Send completion event with final checkpoint ID
         final_state = agent.get_state(config)
@@ -1663,10 +1748,19 @@ def run_agent(request: AgentRequest, http_request: Request):
     # Create message queue for this session
     message_queues[thread_id] = queue.Queue(maxsize=1000)
     
+    # Build edit metadata if this is an edit operation
+    edit_metadata = None
+    if request.edit_group_id:
+        edit_metadata = {
+            "edit_group_id": request.edit_group_id,
+            "edit_version": request.edit_version,
+            "original_message_index": request.original_message_index
+        }
+    
     # START DETACHED BACKGROUND THREAD
     bg_thread = threading.Thread(
         target=run_agent_background,
-        args=(agent, thread_id, request.prompt, config, request.deep_research, request.literature_survey, request.persona),
+        args=(agent, thread_id, request.prompt, config, request.deep_research, request.literature_survey, request.persona, edit_metadata),
         daemon=True
     )
     bg_thread.start()
@@ -1808,14 +1902,30 @@ def _serialize_message(msg) -> Optional[Dict[str, Any]]:
                     parts.append(text.strip())
             content = ''.join(parts).strip()
 
+        # Extract edit metadata from additional_kwargs if present
+        additional_kwargs = data.get("additional_kwargs", {})
+        edit_group_id = additional_kwargs.get("edit_group_id")
+        edit_version = additional_kwargs.get("edit_version")
+        is_edit = additional_kwargs.get("is_edit", False)
+        original_message_index = additional_kwargs.get("original_message_index")
+
         # Ensure tool_calls and name are included for UI status display
-        return {
+        result = {
             "type": data.get("type"),
             "content": content,
             "tool_calls": data.get("tool_calls", []),
             "name": data.get("name"),
             "role": data.get("role")
         }
+        
+        # Include edit metadata if present
+        if edit_group_id:
+            result["edit_group_id"] = edit_group_id
+            result["edit_version"] = edit_version
+            result["is_edit"] = is_edit
+            result["original_message_index"] = original_message_index
+        
+        return result
     except Exception:
         return None
 

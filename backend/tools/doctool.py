@@ -5,24 +5,36 @@ Generates professional Word documents with level-appropriate formatting
 import base64
 import io
 import re
+import json
 import threading
 from typing import Optional
 from pydantic import BaseModel, Field
 from langchain.tools import tool
+from langchain_core.runnables import RunnableConfig
 
 # Thread-safe storage for download data from subagent tool calls
-_pending_downloads = {}
+# Uses a global latest-download approach instead of thread IDs because
+# LangGraph runs tools via asyncio.run_in_executor() in a thread pool,
+# so the storing thread ID differs from the retrieving thread ID.
+_latest_download = None
 _download_lock = threading.Lock()
 
 def _store_pending_download(data: dict):
-    """Store download data keyed by current thread ID."""
+    """Store download data globally (latest wins)."""
+    global _latest_download
     with _download_lock:
-        _pending_downloads[threading.current_thread().ident] = data
+        _latest_download = data
+        print(f"  💾 [doctool] Download stored in pending: {data.get('filename', 'unknown')}")
 
 def get_pending_download() -> dict | None:
-    """Retrieve and remove pending download data for the current thread."""
+    """Retrieve and remove the latest pending download data."""
+    global _latest_download
     with _download_lock:
-        return _pending_downloads.pop(threading.current_thread().ident, None)
+        data = _latest_download
+        _latest_download = None
+        return data
+
+import requests
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -242,6 +254,39 @@ def process_markdown_content(doc: Document, content: str, report_level: str):
         
         # Not a table - process as regular content
         if line:
+            # Check for image markdown: ![caption](url)
+            img_match = re.match(r'^!\[([^\]]*)\]\(([^\)]+)\)$', line)
+            if img_match:
+                caption = img_match.group(1)
+                img_url = img_match.group(2)
+                try:
+                    # Download image from URL
+                    response = requests.get(img_url, timeout=15, headers={
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    })
+                    if response.status_code == 200:
+                        img_data = io.BytesIO(response.content)
+                        # Add image to document (width 5 inches)
+                        try:
+                            doc.add_picture(img_data, width=Inches(5))
+                            # Add caption below image
+                            if caption:
+                                caption_para = doc.add_paragraph()
+                                caption_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                                caption_run = caption_para.add_run(f"Fig: {caption}")
+                                caption_run.italic = True
+                                caption_run.font.size = Pt(10)
+                            doc.add_paragraph()  # Space after image
+                            print(f"  📷 Added image to DOCX: {caption or img_url[:50]}")
+                        except Exception as img_err:
+                            print(f"  ⚠️ Failed to add image to DOCX: {img_err}")
+                    else:
+                        print(f"  ⚠️ Failed to download image (HTTP {response.status_code}): {img_url[:50]}")
+                except Exception as e:
+                    print(f"  ⚠️ Failed to include image in DOCX: {e}")
+                i += 1
+                continue
+            
             # Handle bullet points
             if line.startswith('- ') or line.startswith('• '):
                 para_text = line[2:]
@@ -272,43 +317,44 @@ def process_markdown_content(doc: Document, content: str, report_level: str):
 
 
 def add_formatted_text(paragraph, text: str):
-    """Add text with Markdown formatting (**bold**, *italic*) to a paragraph."""
-    # Handle **bold**
-    bold_pattern = r'\*\*([^\*]+)\*\*'
-    # Handle *italic*
-    italic_pattern = r'\*([^\*]+)\*'
+    """Add text with Markdown formatting (**bold**, *italic*) to a paragraph.
+    
+    Processes both bold and italic patterns together to handle cases where
+    they appear in any order throughout the text.
+    """
+    import re
+    
+    # Combined pattern: matches **bold** or *italic* (non-greedy)
+    # Process bold first to avoid confusion with italic markers
+    combined_pattern = r'(\*\*(.+?)\*\*|\*([^*]+?)\*)'
     
     current_pos = 0
     
-    # Process bold first
-    for match in re.finditer(bold_pattern, text):
-        # Add normal text before
+    for match in re.finditer(combined_pattern, text):
+        # Add normal text before this match
         if match.start() > current_pos:
             paragraph.add_run(text[current_pos:match.start()])
         
-        # Add bold text
-        run = paragraph.add_run(match.group(1))
-        run.bold = True
+        full_match = match.group(0)
+        
+        if full_match.startswith('**') and full_match.endswith('**'):
+            # Bold text
+            bold_text = match.group(2)
+            if bold_text:
+                run = paragraph.add_run(bold_text)
+                run.bold = True
+        elif full_match.startswith('*') and full_match.endswith('*'):
+            # Italic text
+            italic_text = match.group(3)
+            if italic_text:
+                run = paragraph.add_run(italic_text)
+                run.italic = True
         
         current_pos = match.end()
     
-    # Add remaining text
+    # Add any remaining text after the last match
     if current_pos < len(text):
-        remaining = text[current_pos:]
-        
-        # Process italics in remaining text
-        last_pos = 0
-        for match in re.finditer(italic_pattern, remaining):
-            if match.start() > last_pos:
-                paragraph.add_run(remaining[last_pos:match.start()])
-            
-            run = paragraph.add_run(match.group(1))
-            run.italic = True
-            
-            last_pos = match.end()
-        
-        if last_pos < len(remaining):
-            paragraph.add_run(remaining[last_pos:])
+        paragraph.add_run(text[current_pos:])
 
 
 def add_hyperlink(paragraph, url: str, text: str):
@@ -325,7 +371,8 @@ def export_to_docx(
     sections: list[DocSection],
     filename: str,
     report_level: str = "student",
-    title: str = "Research Report"
+    title: str = "Research Report",
+    config: RunnableConfig = None,
 ) -> str:
     """
     Exports structured report sections to a professional .docx file with level-appropriate formatting.
@@ -335,6 +382,7 @@ def export_to_docx(
     - professor: Professional, organized (slate theme)
     - researcher: Formal, academic (dark theme)
     """
+    
     # Strip leading slashes to prevent issues
     clean_filename = filename.lstrip("/\\")
     if not clean_filename.lower().endswith('.docx'):
@@ -382,6 +430,7 @@ def export_to_docx(
         doc.add_heading(section.heading, level=1)
         
         # Process content with Markdown support
+        # This supports inline images via ![caption](url) markdown syntax
         process_markdown_content(doc, section.content, report_level)
         
         # Add spacing between sections
@@ -391,14 +440,16 @@ def export_to_docx(
     buffer = io.BytesIO()
     doc.save(buffer)
     buffer.seek(0)
+    doc_data = buffer.read()
     
     # Encode as base64 for transmission to frontend
-    doc_base64 = base64.b64encode(buffer.read()).decode('utf-8')
+    doc_base64 = base64.b64encode(doc_data).decode('utf-8')
+    doc_size_kb = len(doc_data) / 1024
     
-    # Store download data for backend recovery (subagent tool outputs may not appear in main stream)
-    _store_pending_download({"filename": clean_filename, "data": doc_base64})
+    # Store download data for backend recovery
+    download_data = {"filename": clean_filename, "data": doc_base64}
+    _store_pending_download(download_data)
     
-    # Return marker with JSON data that frontend can parse - using json.dumps for safety
-    import json
-    json_data = json.dumps({"filename": clean_filename, "data": doc_base64}, ensure_ascii=True)
-    return f'[DOWNLOAD_DOCX]{json_data}'
+    print(f"  📄 DOCX generated: {clean_filename} ({doc_size_kb:.1f} KB)")
+    
+    return f'[DOWNLOAD_DOCX]{{"filename": "{clean_filename}", "data": "{doc_base64}"}}'

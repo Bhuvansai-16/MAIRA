@@ -1,10 +1,11 @@
-import { useState, memo, useEffect } from 'react';
+import { useState, memo } from 'react';
 import { cn } from "../lib/utils";
-import { User, Shield, FileDown, Pencil, Check, X, Copy, CheckCircle2, ChevronLeft, ChevronRight, FileText, Image as ImageIcon } from "lucide-react";
+import { User, Shield, FileDown, Pencil, Check, X, Copy, CheckCircle2, ChevronLeft, ChevronRight, FileText } from "lucide-react";
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
+import { BranchSwitcher } from './BranchSwitcher';
 import { VerificationScore } from './VerificationScore';
 import { VerificationBadge, type VerificationStatus } from './VerificationBadge';
 import { ReasoningBlock } from './ReasoningBlock';
@@ -49,13 +50,6 @@ export const MessageBubble = memo(({
     const [isEditing, setIsEditing] = useState(false);
     const [editContent, setEditContent] = useState(content);
     const [copied, setCopied] = useState(false);
-
-    // Update editContent when content changes (e.g., when switching versions)
-    useEffect(() => {
-        if (!isEditing) {
-            setEditContent(content);
-        }
-    }, [content, isEditing]);
 
     const displayContent = content
         .replace(/\[DOWNLOAD_DOCX\].*$/s, '')
@@ -204,36 +198,13 @@ export const MessageBubble = memo(({
                 
                 {/* Version Navigation - only show for user messages with multiple versions */}
                 {role === "user" && hasMultipleVersions && !isEditing && (
-                    <div className="flex items-center gap-1 bg-white/5 rounded-full px-1 py-0.5 border border-white/10">
-                        <button
-                            onClick={handlePrevVersion}
-                            disabled={currentVersionIndex === 0}
-                            className={cn(
-                                "p-0.5 rounded-full transition-all",
-                                currentVersionIndex === 0 
-                                    ? "text-neutral-600 cursor-not-allowed" 
-                                    : "text-neutral-400 hover:text-white hover:bg-white/10"
-                            )}
-                            title="Previous version"
-                        >
-                            <ChevronLeft size={12} />
-                        </button>
-                        <span className="text-[10px] font-bold text-neutral-400 min-w-[28px] text-center">
-                            {currentVersionIndex + 1}/{totalVersions}
-                        </span>
-                        <button
-                            onClick={handleNextVersion}
-                            disabled={currentVersionIndex >= totalVersions - 1}
-                            className={cn(
-                                "p-0.5 rounded-full transition-all",
-                                currentVersionIndex >= totalVersions - 1 
-                                    ? "text-neutral-600 cursor-not-allowed" 
-                                    : "text-neutral-400 hover:text-white hover:bg-white/10"
-                            )}
-                            title="Next version"
-                        >
-                            <ChevronRight size={12} />
-                        </button>
+                    <div className="ml-2">
+                        <BranchSwitcher 
+                            currentVersion={currentVersionIndex}
+                            totalVersions={totalVersions}
+                            onPrevious={handlePrevVersion}
+                            onNext={handleNextVersion}
+                        />
                     </div>
                 )}
             </div>
@@ -249,7 +220,10 @@ export const MessageBubble = memo(({
                 {/* Edit Button for user messages */}
                 {role === "user" && onEdit && !isEditing && (
                     <button
-                        onClick={() => setIsEditing(true)}
+                        onClick={() => {
+                            setEditContent(content);
+                            setIsEditing(true);
+                        }}
                         className="absolute -left-10 top-4 p-2 rounded-lg opacity-0 group-hover:opacity-100 hover:bg-white/10 text-neutral-500 hover:text-white transition-all"
                         title="Edit message"
                     >
@@ -364,7 +338,8 @@ export const MessageBubble = memo(({
                                     remarkPlugins={[remarkGfm]}
                                     components={{
                                         // Custom link component to open in new tab and style differently if citation
-                                        a: ({ node, ...props }) => {
+                                        a: ({ node: _node, ...props }) => {
+                                            // _node unused
                                             const isCitation = props.href?.includes('#citation');
                                             return (
                                                 <a 

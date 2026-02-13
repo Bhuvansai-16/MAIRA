@@ -6,26 +6,35 @@ import base64
 import io
 import re
 import threading
+import requests
 from datetime import datetime
 from pydantic import BaseModel, Field
 from langchain.tools import tool
+from langchain_core.runnables import RunnableConfig
 
 # Thread-safe storage for download data from subagent tool calls
-# Keyed by thread ident so concurrent agent runs don't interfere
-_pending_downloads = {}
+# Uses a global latest-download approach instead of thread IDs because
+# LangGraph runs tools via asyncio.run_in_executor() in a thread pool,
+# so the storing thread ID differs from the retrieving thread ID.
+_latest_download = None
 _download_lock = threading.Lock()
 
 def _store_pending_download(data: dict):
-    """Store download data keyed by current thread ID."""
+    """Store download data globally (latest wins)."""
+    global _latest_download
     with _download_lock:
-        _pending_downloads[threading.current_thread().ident] = data
+        _latest_download = data
+        print(f"  💾 [pdftool] Download stored in pending: {data.get('filename', 'unknown')}")
 
 def get_pending_download() -> dict | None:
-    """Retrieve and remove pending download data for the current thread."""
+    """Retrieve and remove the latest pending download data."""
+    global _latest_download
     with _download_lock:
-        return _pending_downloads.pop(threading.current_thread().ident, None)
+        data = _latest_download
+        _latest_download = None
+        return data
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, KeepTogether
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, KeepTogether, Image
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.units import inch
@@ -246,11 +255,14 @@ def create_table_flowable(table_data: list[list[str]], styles, report_level: str
 
 
 def process_markdown_formatting(text: str) -> str:
-    """Convert Markdown formatting to ReportLab HTML."""
-    # **bold** → <b>bold</b>
-    text = re.sub(r'\*\*([^\*]+)\*\*', r'<b>\1</b>', text)
-    # *italic* → <i>italic</i>
-    text = re.sub(r'\*([^\*]+)\*', r'<i>\1</i>', text)
+    """Convert Markdown formatting to ReportLab HTML.
+    
+    Uses non-greedy matching for better handling of multiple formatting markers.
+    """
+    # **bold** → <b>bold</b> (non-greedy)
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    # *italic* → <i>italic</i> (non-greedy, exclude asterisks in content)
+    text = re.sub(r'\*([^*]+?)\*', r'<i>\1</i>', text)
     # [text](url) → <link href="url">text</link>
     text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<link href="\2" color="blue">\1</link>', text)
     return text
@@ -312,6 +324,37 @@ def process_content_with_tables(content: str, styles, report_level: str) -> list
         
         # Not a table - process as regular content
         if line:
+            # Check for image markdown: ![caption](url)
+            img_match = re.match(r'^!\[([^\]]*)\]\(([^\)]+)\)$', line)
+            if img_match:
+                caption = img_match.group(1)
+                img_url = img_match.group(2)
+                try:
+                    # Download image from URL
+                    response = requests.get(img_url, timeout=10, headers={
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    })
+                    if response.status_code == 200:
+                        img_data = io.BytesIO(response.content)
+                        # Create ReportLab Image (scaled to fit page width, max 5x3.5 inches)
+                        try:
+                            img = Image(img_data, width=5*inch, height=3.5*inch, kind='proportional')
+                            flowables.append(Spacer(1, 12))
+                            flowables.append(img)
+                            if caption:
+                                # Add caption below image
+                                flowables.append(Spacer(1, 6))
+                                flowables.append(Paragraph(f"<i>Fig: {caption}</i>", styles['Italic']))
+                            flowables.append(Spacer(1, 12))
+                        except Exception as img_err:
+                            print(f"Failed to create image flowable: {img_err}")
+                    else:
+                        print(f"Failed to download image (HTTP {response.status_code}): {img_url}")
+                except Exception as e:
+                    print(f"Failed to include image {img_url}: {e}")
+                i += 1
+                continue
+            
             # Handle bullet points
             if line.startswith('- ') or line.startswith('• '):
                 para_text = line[2:]
@@ -381,7 +424,8 @@ def export_to_pdf(
     sections: list[DocSection],
     filename: str = "MAIRA_Report.pdf",
     report_title: str = "Research Report",
-    report_level: str = "student"
+    report_level: str = "student",
+    config: RunnableConfig = None,
 ) -> str:
     """
     Generates a professional PDF with level-appropriate formatting and Markdown support.
@@ -396,8 +440,10 @@ def export_to_pdf(
     - **bold** and *italic* formatting
     - [links](url) with clickable hyperlinks
     - Bullet points and lists
+    - Images via ![caption](url) markdown syntax
     - Level-specific color schemes and spacing
     """
+    
     clean_filename = filename.lstrip("/\\").replace(" ", "_")
     if not clean_filename.lower().endswith(".pdf"):
         clean_filename += ".pdf"
@@ -428,6 +474,7 @@ def export_to_pdf(
         story.append(Spacer(1, 12))
 
         # Process content with table and formatting support
+        # This supports inline images via ![caption](url) markdown syntax
         content_flowables = process_content_with_tables(section.content, styles, report_level)
         story.extend(content_flowables)
         
@@ -436,12 +483,16 @@ def export_to_pdf(
     try:
         doc.build(story)
         buffer.seek(0)
-        pdf_base64 = base64.b64encode(buffer.read()).decode('utf-8')
-        # Store download data for backend recovery (subagent tool outputs may not appear in main stream)
-        _store_pending_download({"filename": clean_filename, "data": pdf_base64})
-        # Use json.dumps for proper JSON escaping
-        import json
-        json_data = json.dumps({"filename": clean_filename, "data": pdf_base64}, ensure_ascii=True)
-        return f'[DOWNLOAD_PDF]{json_data}'
+        pdf_data = buffer.read()
+        pdf_base64 = base64.b64encode(pdf_data).decode('utf-8')
+        pdf_size_kb = len(pdf_data) / 1024
+        
+        # Store download data for backend recovery
+        download_data = {"filename": clean_filename, "data": pdf_base64}
+        _store_pending_download(download_data)
+        
+        print(f"  📄 PDF generated: {clean_filename} ({pdf_size_kb:.1f} KB)")
+        
+        return f'[DOWNLOAD_PDF]{{"filename": "{clean_filename}", "data": "{pdf_base64}"}}'
     except Exception as e:
         return f"PDF generation error: {str(e)}"

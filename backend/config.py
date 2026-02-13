@@ -140,7 +140,14 @@ kimi_k2 = ChatGroq(model="moonshotai/kimi-k2-instruct-0905", temperature=0)
 # Anthropic Direct Models
 claude_opus_4_5 = ChatAnthropic(model="claude-opus-4-5-20251101", temperature=0.2)
 claude_sonnet_4_5 = ChatAnthropic(model="claude-sonnet-4-5-20250929", temperature=0.2)
+from botocore.config import Config # Add this import
 
+# Define a robust config for long-running research tasks
+bedrock_research_config = Config(
+    read_timeout=600,       # 10 minutes for complex reasoning
+    connect_timeout=60,
+    retries={'max_attempts': 3}
+)
 # AWS Bedrock Models
 claude_3_5_sonnet_aws = ChatBedrockConverse(
     model_id="anthropic.claude-3-5-sonnet-20240620-v1:0",
@@ -148,6 +155,7 @@ claude_3_5_sonnet_aws = ChatBedrockConverse(
     aws_access_key_id=aws_access_key_id,
     aws_secret_access_key=aws_secret_access_key,
     temperature=0.2,
+    config=bedrock_research_config  # Use the robust config for research tasks
 )
 
 claude_sonnet_4_5_aws = ChatBedrockConverse(
@@ -156,6 +164,7 @@ claude_sonnet_4_5_aws = ChatBedrockConverse(
     aws_access_key_id=aws_access_key_id,
     aws_secret_access_key=aws_secret_access_key,
     temperature=0.2,
+    config=bedrock_research_config  # Use the robust config for research tasks
 )
 
 claude_opus_4_6_aws = ChatBedrockConverse(
@@ -164,6 +173,7 @@ claude_opus_4_6_aws = ChatBedrockConverse(
     aws_access_key_id=aws_access_key_id,
     aws_secret_access_key=aws_secret_access_key,
     temperature=0.2,
+    config=bedrock_research_config  # Use the robust config for research tasks
 )
 
 
@@ -225,9 +235,10 @@ def get_current_model_info():
 # DEFAULT EXPORTS
 # =====================================================
 # Main agent model (default: Claude Opus 4.6 AWS)
-main_agent_model = gemini_3_pro
+main_agent_model = claude_opus_4_6_aws
 
-# Subagent model (default: Claude Sonnet 4.5 AWS)
-subagent_model = gemini_3_flash
+# Subagent model (default: Gemini 2.5 Pro)
+subagent_model = gemini_3_pro
+
 
 print("✅ Config loaded - Models ready for import")

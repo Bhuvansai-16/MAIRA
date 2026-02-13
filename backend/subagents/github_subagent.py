@@ -265,6 +265,7 @@ def analyze_github_repo(github_url: str) -> str:
 def get_github_file_content(github_url: str, file_path: str) -> str:
     """
     Read the content of a specific file from a GitHub repository.
+    Automatically skips binary files and files larger than 50KB to prevent context overflow.
     
     Args:
         github_url: GitHub repository URL (e.g., 'github.com/owner/repo')
@@ -277,6 +278,34 @@ def get_github_file_content(github_url: str, file_path: str) -> str:
     print(f"🔧 get_github_file_content called with:")
     print(f"   github_url: '{github_url}' (len={len(github_url)})")
     print(f"   file_path: '{file_path}'")
+    
+    # ===== SAFETY CHECK: Binary/Non-Text File Extensions =====
+    BINARY_EXTENSIONS = {
+        # Executables & compiled
+        '.exe', '.dll', '.so', '.dylib', '.bin', '.o', '.obj', '.class', '.pyc', '.pyo',
+        # Archives
+        '.zip', '.tar', '.gz', '.bz2', '.7z', '.rar', '.jar', '.war', '.ear',
+        # Images
+        '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.svg', '.webp', '.tiff',
+        # Media
+        '.mp3', '.mp4', '.avi', '.mov', '.wav', '.flac', '.mkv', '.webm',
+        # Documents (binary)
+        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+        # Data (large/binary)
+        '.sqlite', '.db', '.pickle', '.pkl', '.npy', '.npz', '.h5', '.hdf5',
+        # Lock files (often huge)
+        '.lock', 'package-lock.json', 'yarn.lock', 'Cargo.lock', 'poetry.lock',
+        # Other
+        '.woff', '.woff2', '.ttf', '.otf', '.eot',  # Fonts
+        '.min.js', '.min.css',  # Minified (often huge single lines)
+    }
+    
+    file_ext = '.' + file_path.split('.')[-1].lower() if '.' in file_path else ''
+    file_name = file_path.split('/')[-1].lower()
+    
+    # Check if it's a known binary/problematic file
+    if file_ext in BINARY_EXTENSIONS or file_name in BINARY_EXTENSIONS:
+        return f"⚠️ Skipping binary/non-text file: {file_path}\nFile type '{file_ext or file_name}' is not suitable for text extraction. Use get_github_directory to explore the structure instead."
     
     parsed = _parse_github_url(github_url)
     if not parsed:
@@ -301,16 +330,38 @@ def get_github_file_content(github_url: str, file_path: str) -> str:
         if data.get("type") == "dir":
             return f"❌ '{file_path}' is a directory. Use get_github_directory to list its contents."
         
+        # ===== SAFETY CHECK: File Size =====
+        file_size = data.get("size", 0)
+        MAX_FILE_SIZE = 50 * 1024  # 50KB limit
+        
+        if file_size > MAX_FILE_SIZE:
+            size_kb = file_size / 1024
+            return f"""⚠️ File too large to read: {file_path}
+**Size:** {size_kb:.1f} KB (limit: 50 KB)
+**URL:** {data.get('html_url', 'N/A')}
+
+This file exceeds the safe size limit for context. To avoid system overload:
+- View the file directly on GitHub: {data.get('html_url', 'N/A')}
+- Use `search_github_code` to find specific code snippets
+- Request a specific section if you know what you're looking for"""
+        
         # Decode content (base64 encoded by GitHub API)
         import base64
-        content = base64.b64decode(data.get("content", "")).decode("utf-8")
+        try:
+            content = base64.b64decode(data.get("content", "")).decode("utf-8")
+        except UnicodeDecodeError:
+            return f"⚠️ Cannot decode file: {file_path}\nThis appears to be a binary file that cannot be displayed as text."
+        
+        # Additional truncation for safety (in case size check was bypassed)
+        MAX_CONTENT_LENGTH = 12000  # ~3000 tokens
+        truncated = len(content) > MAX_CONTENT_LENGTH
         
         return f"""## File: {file_path}
 **Size:** {data.get('size', 0):,} bytes
 **URL:** {data.get('html_url', 'N/A')}
 
 ```
-{content[:15000]}{"... [truncated]" if len(content) > 15000 else ""}
+{content[:MAX_CONTENT_LENGTH]}{"... [truncated - file too long]" if truncated else ""}
 ```
 """
         
@@ -558,11 +609,31 @@ AVAILABLE TOOLS (Dynamic - work with ANY public GitHub repo URL):
 - search_github_code: Search for code patterns, functions, or variables
 - get_github_issues: List open/closed issues
 
+⚠️ FILE READING SAFETY RULES (PREVENT CONTEXT OVERFLOW):
+The `get_github_file_content` tool has built-in guards:
+- **Binary files are SKIPPED**: .exe, .dll, .zip, .png, .pdf, .lock, etc.
+- **Large files (>50KB) are SKIPPED**: Lock files, minified JS, large data files
+- **Content is truncated at 12KB** to protect context window
+
+**If a file is skipped, the tool will return a helpful message - DON'T retry, move on.**
+
+SMART FILE READING STRATEGY:
+1. FIRST use `get_github_directory` to see file sizes
+2. ONLY read files that are:
+   - Text-based (.py, .js, .ts, .md, .json, .yaml, .toml, etc.)
+   - Small enough (<50KB, preferably <20KB)
+   - Relevant to the user's question
+3. SKIP these files entirely:
+   - package-lock.json, yarn.lock, Cargo.lock, poetry.lock (huge!)
+   - .min.js, .min.css (minified, unreadable)
+   - Any binary/media files
+4. If you need to understand a large file, use `search_github_code` instead
+
 WORKFLOW:
 1. When given a GitHub URL, FIRST use `analyze_github_repo` to get the full picture
-2. Then explore specific areas based on the user's question
-3. Read important files (README, main source files, configs) to understand the project
-4. Search code if looking for specific functionality
+2. Use `get_github_directory` to explore structure and note file sizes
+3. Read ONLY relevant, reasonably-sized text files
+4. Search code if looking for specific functionality within large files
 
 OUTPUT FORMAT:
 - **Repository Summary**: High-level overview of what the project does
@@ -574,7 +645,7 @@ OUTPUT FORMAT:
 GUIDELINES:
 - Always start with `analyze_github_repo` to understand the repo
 - Read README.md for project documentation
-- Check package.json, requirements.txt, Cargo.toml, etc. for dependencies
+- Check package.json, requirements.txt, Cargo.toml, etc. for dependencies (but NOT lock files!)
 - Look at the src/ or lib/ folder for main source code
 - Be thorough but concise in your analysis
 - Keep responses under 500 words to maintain clean context for other agents

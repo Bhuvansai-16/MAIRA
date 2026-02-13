@@ -42,6 +42,7 @@ python-docx==1.1.2
 reportlab==4.2.5
 pypdf2==3.0.1
 pypdf>=5.0.0
+pypandoc-binary==1.13
 
 # Utilities
 uuid7==0.1.0
@@ -52,3 +53,6 @@ google-generativeai==0.8.3
 
 # GitHub Integration
 PyGithub>=2.1.0
+
+# Supabase Storage
+supabase>=2.0.0

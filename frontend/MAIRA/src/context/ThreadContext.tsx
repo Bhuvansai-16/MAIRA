@@ -4,18 +4,28 @@ import { useParams, useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import type { CheckpointInfo, VerificationData } from '../types/agent';
 import { ThreadContext } from './ThreadContextDefinition';
-import type { Thread, Message, ActiveStep, BackendMessage, ThreadContextType, MessageVersion } from './ThreadContextDefinition';
+import type { Thread, Message, ActiveStep, BackendMessage, ThreadContextType, MessageVersion, MessageMetadata } from './ThreadContextDefinition';
 import { useAuth } from './AuthContext';
 import { toast } from 'sonner';
+import { useThreadIDParam } from '../hooks/useThreadIDParam';
 
 // Re-export types for consumers
-export type { Thread, Message, ActiveStep, ThreadContextType, MessageVersion };
+export type { Thread, Message, ActiveStep, ThreadContextType, MessageVersion, MessageMetadata };
 
 const API_BASE = 'http://localhost:8000';
 
 // Helper function to format messages from backend
 const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
-    const formattedMessages: Message[] = messages.map((msg) => {
+    // Debug: Log raw messages from backend
+    console.log('🔍 RAW messages from backend:', messages.length);
+    messages.forEach((msg, idx) => {
+        const rawContent = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+        const hasEditMeta = rawContent.includes('EDIT_META');
+        console.log(`  RAW[${idx}] type=${msg.type} role=${msg.role} hasEditMeta=${hasEditMeta} content=${rawContent.substring(0, 100)}...`);
+    });
+
+    // First pass: convert all messages to Message format
+    const allMessages: Message[] = messages.map((msg) => {
         const isUser = msg.type === 'human' || msg.role === 'user';
         const isTool = msg.type === 'tool' || msg.role === 'tool';
 
@@ -35,6 +45,28 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
         }
 
         if (!content.trim()) return null;
+
+        // Extract EDIT_META from content (embedded by backend for persistence)
+        // Format: [EDIT_META:{"g":"groupId","v":1,"i":0}]
+        let editGroupId: string | undefined;
+        let editVersion: number | undefined;
+        let originalMessageIndex: number | undefined;
+        let isEdit = false;
+        
+        const editMetaMatch = content.match(/\[EDIT_META:(\{[^}]+\})\]/);
+        if (editMetaMatch) {
+            try {
+                const editMeta = JSON.parse(editMetaMatch[1]);
+                editGroupId = editMeta.g;
+                editVersion = editMeta.v;
+                originalMessageIndex = editMeta.i;
+                isEdit = true;
+                // Remove the edit meta tag from content
+                content = content.replace(/\[EDIT_META:\{[^}]+\}\]/, '');
+            } catch (e) {
+                console.warn('Failed to parse EDIT_META:', e);
+            }
+        }
 
         // Extract attachments from text prefix if present (persisted from [UPLOADED_FILES: ...])
         let attachments: { name: string; type: 'file' | 'image' }[] | undefined;
@@ -95,36 +127,177 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
             role: isUser ? 'user' : 'agent',
             content: content,
             download: downloadData,
-            attachments: attachments
+            attachments: attachments,
+            checkpoint_id: (msg as any).checkpoint_id,
+            parent_checkpoint_id: (msg as any).parent_checkpoint_id,
+            // Edit versioning metadata extracted from [EDIT_META:...] in content
+            editGroupId: editGroupId,
+            currentVersionIndex: editVersion,
+            isEdit: isEdit,
+            originalMessageIndex: originalMessageIndex
         } as Message;
-    }).reduce((acc: Message[], msg) => {
-        // Filter nulls
-        if (!msg) return acc;
+    }).filter((msg): msg is Message => msg !== null);
+
+    // Debug: Log what we received from backend
+    console.log('📥 formatMessagesFromBackend received:', allMessages.length, 'messages');
+    allMessages.forEach((msg, idx) => {
+        console.log(`  [${idx}] ${msg.role}: "${msg.content.substring(0, 50)}..." isEdit=${msg.isEdit}, origIdx=${msg.originalMessageIndex}, editGroup=${msg.editGroupId}`);
+    });
+
+    // Second pass: Identify which messages are edits and group them
+    // Strategy: Messages with isEdit=true should REPLACE original messages
+    // originalMessageIndex refers to the Nth user message in conversation order
+    
+    // First, create a map of user message number -> array index
+    const userMessageIndices: number[] = []; // userMessageIndices[n] = index in allMessages of nth user message
+    allMessages.forEach((msg, idx) => {
+        if (msg.role === 'user' && !msg.isEdit) {
+            userMessageIndices.push(idx);
+        }
+    });
+    
+    // Build a map: originalMessageIndex (user msg number) -> list of edit versions
+    const editsByUserMsgNum = new Map<number, Message[]>();
+    const editedMessageIndices = new Set<number>(); // Indices in allMessages that are edits (to skip)
+    
+    allMessages.forEach((msg, idx) => {
+        if (msg.isEdit && msg.originalMessageIndex !== undefined) {
+            const userMsgNum = msg.originalMessageIndex;
+            if (!editsByUserMsgNum.has(userMsgNum)) {
+                editsByUserMsgNum.set(userMsgNum, []);
+            }
+            editsByUserMsgNum.get(userMsgNum)!.push(msg);
+            editedMessageIndices.add(idx);
+            // Also mark the agent response after this edit as needing special handling
+            const nextIdx = idx + 1;
+            if (allMessages[nextIdx]?.role === 'agent') {
+                editedMessageIndices.add(nextIdx);
+            }
+        }
+    });
+    
+    // Also mark original user messages and their agent responses as skipped if they have edits
+    editsByUserMsgNum.forEach((edits, userMsgNum) => {
+        if (userMsgNum < userMessageIndices.length) {
+            const origUserIdx = userMessageIndices[userMsgNum];
+            // Mark original agent response (follows original user) as skipped
+            const origAgentIdx = origUserIdx + 1;
+            if (allMessages[origAgentIdx]?.role === 'agent') {
+                editedMessageIndices.add(origAgentIdx);
+            }
+        }
+    });
+
+    console.log('📊 Edit grouping:', { 
+        userMessageCount: userMessageIndices.length, 
+        editGroups: Array.from(editsByUserMsgNum.entries()).map(([k, v]) => ({ userMsgNum: k, editCount: v.length })),
+        skippedIndices: Array.from(editedMessageIndices)
+    });
+
+    // Third pass: Build final list, replacing originals with their latest edited versions
+    const formattedMessages: Message[] = [];
+    let userMsgCounter = 0; // Track which user message number we're on
+    
+    allMessages.forEach((msg, idx) => {
+        // Skip messages that are edits (they'll replace their originals)
+        if (editedMessageIndices.has(idx)) return;
         
-        // Handle merging of consecutive agent messages for downloads
+        // Check if this user message has edits that should replace it
+        if (msg.role === 'user') {
+            const editsForThisUserMsg = editsByUserMsgNum.get(userMsgCounter);
+            
+            if (editsForThisUserMsg && editsForThisUserMsg.length > 0) {
+                // This is an original message that was edited - show the latest edit with versions
+                const latestEdit = editsForThisUserMsg[editsForThisUserMsg.length - 1];
+                
+                // Build versions array including the original
+                const versions: import('./ThreadContextDefinition').MessageVersion[] = [
+                    { userContent: msg.content, timestamp: new Date().toISOString() }
+                ];
+                
+                // Get corresponding agent responses if they exist
+                const nextMsgIdx = idx + 1;
+                const nextMsg = allMessages[nextMsgIdx];
+                if (nextMsg && nextMsg.role === 'agent') {
+                    versions[0].agentContent = nextMsg.content;
+                    versions[0].agentReasoning = nextMsg.reasoning;
+                    versions[0].agentDownload = nextMsg.download;
+                }
+                
+                // Add edited versions
+                editsForThisUserMsg.forEach((editMsg) => {
+                    // Find the agent response for this edit
+                    const editMsgIdx = allMessages.indexOf(editMsg);
+                    const editAgentMsg = allMessages[editMsgIdx + 1];
+                    
+                    versions.push({
+                        userContent: editMsg.content,
+                        agentContent: editAgentMsg?.role === 'agent' ? editAgentMsg.content : undefined,
+                        agentReasoning: editAgentMsg?.role === 'agent' ? editAgentMsg.reasoning : undefined,
+                        agentDownload: editAgentMsg?.role === 'agent' ? editAgentMsg.download : undefined,
+                        timestamp: new Date().toISOString()
+                    });
+                });
+                
+                const editGroupId = latestEdit.editGroupId || `auto_${userMsgCounter}`;
+                
+                // Push the latest user version with all versions data
+                formattedMessages.push({
+                    ...latestEdit,
+                    versions,
+                    currentVersionIndex: versions.length - 1,
+                    editGroupId
+                });
+                
+                // Push the latest agent version
+                const latestEditIdx = allMessages.indexOf(latestEdit);
+                const latestAgentMsg = allMessages[latestEditIdx + 1];
+                if (latestAgentMsg && latestAgentMsg.role === 'agent') {
+                    formattedMessages.push({
+                        ...latestAgentMsg,
+                        versions,
+                        currentVersionIndex: versions.length - 1,
+                        editGroupId
+                    });
+                } else if (nextMsg && nextMsg.role === 'agent') {
+                    // Fallback to original agent response if edit doesn't have one yet
+                    formattedMessages.push({
+                        ...nextMsg,
+                        versions,
+                        currentVersionIndex: 0,
+                        editGroupId
+                    });
+                }
+                
+                userMsgCounter++;
+                return;
+            }
+            
+            userMsgCounter++;
+        }
+        
+        // Regular message - just add it
+        formattedMessages.push(msg);
+    });
+
+    // Final pass: merge consecutive agent messages for downloads
+    const mergedMessages = formattedMessages.reduce((acc: Message[], msg) => {
         if (msg.role === 'agent') {
             const prevMsg = acc[acc.length - 1];
             
-            // Case 1: Current message has download, previous message looks like its content
             if (msg.download && prevMsg && prevMsg.role === 'agent') {
-                // Merge download into previous message
                 prevMsg.download = msg.download;
-                
-                // If current message has actual content other than default
                 if (msg.content !== 'Report generated successfully! Click below to download.') {
                      prevMsg.content = `${prevMsg.content}\n\n${msg.content}`;
                 }
                 return acc;
             }
             
-            // Case 2: Current message is content, previous message was just a download placeholder
             if (prevMsg && prevMsg.role === 'agent' && prevMsg.download) {
                  if (prevMsg.content === 'Report generated successfully! Click below to download.') {
-                     // Replace placeholder with real content
                      prevMsg.content = msg.content;
                      return acc;
                  }
-                 // Or append it
                  prevMsg.content = `${prevMsg.content}\n\n${msg.content}`;
                  return acc;
             }
@@ -134,14 +307,14 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
         return acc;
     }, []);
 
-    if (formattedMessages.length === 0) {
-        formattedMessages.push({
+    if (mergedMessages.length === 0) {
+        mergedMessages.push({
             role: 'agent',
             content: "Hello! I am MAIRA, your advanced research agent. How can I help you today?"
         });
     }
 
-    return formattedMessages;
+    return mergedMessages;
 };
 
 interface ThreadProviderProps {
@@ -162,6 +335,10 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
     const [checkpoints, setCheckpoints] = useState<CheckpointInfo[]>([]);
     const [isLoading, setIsLoading] = useState(false);
     const [isLoadingThreads, setIsLoadingThreads] = useState(false);
+    const [isReconnecting, setIsReconnecting] = useState(false); // Track reconnection status
+    const [reconnectOnMount, setReconnectOnMount] = useState(true); // Control auto-reconnect behavior
+    
+    // Internal state for toggles (wrappers below handle logic)
     const [deepResearch, setDeepResearch_internal] = useState(false);
     const [literatureSurvey, setLiteratureSurvey_internal] = useState(false);
     const [persona, setPersona] = useState<string>("default");
@@ -178,7 +355,6 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         if (enabled) setDeepResearch_internal(false);
     }, []);
     const [lastEventId, setLastEventId] = useState<string | null>(null);
-    const [isReconnecting, setIsReconnecting] = useState(false);
     const [activeSteps, setActiveSteps] = useState<Record<string, ActiveStep>>({});
     
     // Reconnection state
@@ -204,35 +380,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         }
     }, [currentThreadId]);
 
-    // Restore thread from localStorage only if user is logged in and thread belongs to them
-    useEffect(() => {
-        const restoreThread = async () => {
-            if (!user?.id) return;
-            
-            const savedThreadId = localStorage.getItem('maira_current_thread_id');
-            if (!savedThreadId) return;
-            
-            // Verify thread belongs to current user by checking if it's in their threads list
-            try {
-                const response = await axios.get(`${API_BASE}/threads?user_id=${user.id}`);
-                const userThreads = response.data as Thread[];
-                const threadBelongsToUser = userThreads.some(t => t.thread_id === savedThreadId);
-                
-                if (threadBelongsToUser) {
-                    console.log('✅ Restored thread from localStorage:', savedThreadId);
-                    setCurrentThreadId(savedThreadId);
-                } else {
-                    console.log('⚠️ Saved thread does not belong to current user, clearing');
-                    localStorage.removeItem('maira_current_thread_id');
-                }
-            } catch (error) {
-                console.warn('Failed to verify saved thread:', error);
-                localStorage.removeItem('maira_current_thread_id');
-            }
-        };
-        
-        restoreThread();
-    }, [user?.id]);
+
 
     // Clear state when user changes (logout or switch account)
     const prevUserIdRef = useRef<string | null>(null);
@@ -305,6 +453,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
             const response = await axios.get(`${API_BASE}/threads/${threadId}/messages`);
             const messages = response.data.messages || [];
             const formattedMessages = formatMessagesFromBackend(messages);
+            
             setCurrentMessages(formattedMessages);
         } catch (error) {
             console.error('Failed to load thread messages:', error);
@@ -317,27 +466,23 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         }
     }, []);
 
-    // Branch from a specific checkpoint
-    const branchFromCheckpoint = useCallback(async (checkpointId: string): Promise<Thread | null> => {
-        if (!currentThreadId) return null;
-        try {
-            const response = await axios.post(`${API_BASE}/threads/${currentThreadId}/branch`, {
-                checkpoint_id: checkpointId
-            });
-            const newThread = response.data;
-            setThreads(prev => [newThread, ...prev]);
-            await selectThread(newThread.thread_id);
-            return newThread;
-        } catch (error) {
-            console.error('Failed to branch from checkpoint:', error);
-            return null;
-        }
-    }, [currentThreadId, selectThread]);
-
     // Reconnect to an active stream
     const reconnectToStream = useCallback(async (threadId: string) => {
+        setIsReconnecting(true);
+        setIsLoading(true);
+
         try {
+            console.log('🔄 Attempting to reconnect to stream for thread:', threadId);
             const response = await fetch(`${API_BASE}/sessions/${threadId}/stream?from_index=0`);
+            
+            if (!response.ok) {
+                // If 404 or other error, it means no active run exists
+                console.log('ℹ️ No active stream found for this thread');
+                setIsReconnecting(false);
+                setIsLoading(false);
+                return;
+            }
+
             const reader = response.body?.getReader();
             const decoder = new TextDecoder();
             let buffer = '';
@@ -346,6 +491,37 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
             if (!reader) {
                 throw new Error('No response body reader available');
             }
+
+            // Ensure we have a placeholder if needed - using functional update to get latest state
+            setCurrentMessages(prev => {
+                if (prev.length === 0) return prev;
+                
+                const updated = [...prev];
+                const lastMsg = updated[updated.length - 1];
+                
+                // If last message is from user, append a placeholder
+                if (lastMsg.role === 'user') {
+                    updated.push({
+                        role: 'agent',
+                        content: '', // Empty initially, will be filled by stream
+                        status: 'Reconnecting...',
+                        type: 'streaming'
+                    });
+                    return updated;
+                }
+                
+                // If last message is from agent but not streaming, mark it as streaming
+                if (lastMsg.role === 'agent') {
+                    updated[updated.length - 1] = {
+                        ...lastMsg,
+                        type: 'streaming',
+                        status: 'Reconnecting...'
+                    };
+                    return updated;
+                }
+                
+                return updated;
+            });
 
             while (true) {
                 const { done, value } = await reader.read();
@@ -361,9 +537,44 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                     if (line.startsWith('data: ')) {
                         try {
                             const data = JSON.parse(line.slice(6));
-                            console.log('Reconnect SSE data:', data);
+                            // console.log('Reconnect SSE data:', data);
                             
                             if (data.type === 'ping') continue;
+
+                            // Handle real-time status updates (Sync with sendMessage logic)
+                            if (data.type === 'status') {
+                                const { tool, step, message } = data;
+                                if (tool) {
+                                    // Update active steps for UI tracking
+                                    setActiveSteps(prev => ({
+                                        ...prev,
+                                        [tool]: {
+                                            tool,
+                                            message: message || tool,
+                                            status: step === 'start' ? 'loading' : 'done',
+                                            timestamp: Date.now()
+                                        }
+                                    }));
+                                    
+                                    // Update streaming message status text
+                                    if (step === 'start') {
+                                        setCurrentMessages(prev => {
+                                            const updated = [...prev];
+                                            const lastIdx = updated.length - 1;
+                                            
+                                            // Verify the last message is the one we are streaming
+                                            if (updated[lastIdx]?.type === 'streaming') {
+                                                updated[lastIdx] = {
+                                                    ...updated[lastIdx],
+                                                    status: message || `Running ${tool}...`,
+                                                };
+                                            }
+                                            return updated;
+                                        });
+                                    }
+                                }
+                                continue;
+                            }
 
                             if (data.type === 'reconnect_complete') {
                                 setIsReconnecting(false);
@@ -382,8 +593,9 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                                         }
                                         return updated;
                                     });
+                                    break;
                                 }
-                                break;
+                                continue;
                             }
 
                             if (data.type === 'update' && data.messages) {
@@ -397,12 +609,23 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                                         setCurrentMessages(prev => {
                                             const updated = [...prev];
                                             const lastIdx = updated.length - 1;
+                                            
+                                            // Handle case where we need to Append a new message vs Update existing
                                             if (updated[lastIdx]?.type === 'streaming') {
                                                 updated[lastIdx] = {
                                                     ...updated[lastIdx],
                                                     content: accumulatedContent,
-                                                    status: data.replayed ? 'Catching up...' : undefined
+                                                    // Preserve existing status (e.g. "Running Tool...") unless replaying
+                                                    status: data.replayed ? 'Catching up...' : updated[lastIdx].status
                                                 };
+                                            } else if (updated[lastIdx]?.role === 'user') {
+                                                // If last was user, append new agent message
+                                                updated.push({
+                                                    role: 'agent',
+                                                    content: accumulatedContent,
+                                                    type: 'streaming',
+                                                    status: 'Reconnected'
+                                                });
                                             }
                                             return updated;
                                         });
@@ -432,69 +655,115 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                 }
             }
         } catch (error) {
-            console.error('Failed to reconnect to stream:', error);
+            console.error('Reconnect failed:', error);
             setIsReconnecting(false);
             setIsLoading(false);
-            selectThread(threadId);
         }
-    }, [selectThread]);
+    }, [currentThreadId]);
 
+    // Branch from a specific checkpoint
+    const branchFromCheckpoint = useCallback(async (checkpointId: string): Promise<Thread | null> => {
+        if (!currentThreadId) return null;
+        try {
+            const response = await axios.post(`${API_BASE}/threads/${currentThreadId}/branch`, {
+                checkpoint_id: checkpointId
+            });
+            const newThread = response.data;
+            setThreads(prev => [newThread, ...prev]);
+            await selectThread(newThread.thread_id);
+            return newThread;
+        } catch (error) {
+            console.error('Failed to branch from checkpoint:', error);
+            return null;
+        }
+    }, [currentThreadId, selectThread]);
+
+    // Track if we've already handled the initial URL thread
+    const hasHandledUrlThreadRef = useRef(false);
+
+    // PRIMARY: Restore thread from URL on mount (takes priority over localStorage)
+    // This ensures reloading a page with a thread ID in the URL stays on that thread
+    useEffect(() => {
+        const restoreFromUrl = async () => {
+            // Only run once on mount
+            if (hasHandledUrlThreadRef.current) return;
+            if (!user?.id) return;
+            
+            // If URL has a thread ID, prioritize it
+            if (urlThreadId) {
+                hasHandledUrlThreadRef.current = true;
+                console.log('🔗 Restoring thread from URL:', urlThreadId);
+                
+                try {
+                    // Verify thread belongs to current user
+                    const response = await axios.get(`${API_BASE}/threads?user_id=${user.id}`);
+                    const userThreads = response.data as Thread[];
+                    const threadBelongsToUser = userThreads.some(t => t.thread_id === urlThreadId);
+                    
+                    if (threadBelongsToUser) {
+                        // Update localStorage to match URL
+                        localStorage.setItem('maira_current_thread_id', urlThreadId);
+                        // Select the thread and load its messages
+                        await selectThread(urlThreadId);
+                        
+                        // Attempt to reconnect if enabled
+                        if (reconnectOnMount) {
+                             reconnectToStream(urlThreadId);
+                        }
+                    } else {
+                        console.log('⚠️ URL thread does not belong to current user, redirecting');
+                        navigate('/chat', { replace: true });
+                    }
+                } catch (error) {
+                    console.warn('Failed to verify URL thread:', error);
+                    navigate('/chat', { replace: true });
+                }
+            } else {
+                // No URL thread ID, try localStorage
+                hasHandledUrlThreadRef.current = true;
+                const savedThreadId = localStorage.getItem('maira_current_thread_id');
+                if (savedThreadId) {
+                    console.log('💾 Restoring thread from localStorage:', savedThreadId);
+                    
+                    try {
+                        const response = await axios.get(`${API_BASE}/threads?user_id=${user.id}`);
+                        const userThreads = response.data as Thread[];
+                        const threadBelongsToUser = userThreads.some(t => t.thread_id === savedThreadId);
+                        
+                        if (threadBelongsToUser) {
+                            await selectThread(savedThreadId);
+                            // Update URL to match
+                            navigate(`/chat/${savedThreadId}`, { replace: true });
+                            
+                            // Attempt to reconnect if enabled
+                            if (reconnectOnMount) {
+                                reconnectToStream(savedThreadId);
+                            }
+                        } else {
+                            console.log('⚠️ Saved thread does not belong to current user, clearing');
+                            localStorage.removeItem('maira_current_thread_id');
+                        }
+                    } catch (error) {
+                        console.warn('Failed to verify saved thread:', error);
+                        localStorage.removeItem('maira_current_thread_id');
+                    }
+                }
+            }
+        };
+        
+        restoreFromUrl();
+    }, [user?.id, urlThreadId, selectThread, navigate, reconnectOnMount, reconnectToStream]);
+
+    /* 
+    // Handled by restoreFromUrl now to avoid race conditions
     // Check for active session and reconnect — ONLY on initial mount
     useEffect(() => {
         const checkAndReconnect = async () => {
-            // Only run once
-            if (hasCheckedReconnectRef.current) return;
-            hasCheckedReconnectRef.current = true;
-            
-            // Only reconnect if we have a currentThreadId (which was set by user verification)
-            if (!currentThreadId || !user?.id) return;
-
-            try {
-                const response = await axios.get(`${API_BASE}/sessions/${currentThreadId}/status`);
-                const sessionStatus = response.data;
-
-                if (sessionStatus.has_active_stream || sessionStatus.status === 'running') {
-                    console.log('Found active session, reconnecting...', sessionStatus);
-                    setIsReconnecting(true);
-                    setIsLoading(true);
-
-                    try {
-                        const messagesResponse = await axios.get(`${API_BASE}/threads/${currentThreadId}/messages`);
-                        const messages = messagesResponse.data.messages || [];
-                        const formattedMessages = formatMessagesFromBackend(messages);
-                        
-                        if (sessionStatus.prompt) {
-                            const hasUserMessage = formattedMessages.some(
-                                (m: Message) => m.role === 'user' && m.content === sessionStatus.prompt
-                            );
-                            if (!hasUserMessage) {
-                                formattedMessages.push({ role: 'user', content: sessionStatus.prompt });
-                            }
-                        }
-                        
-                        formattedMessages.push({
-                            role: 'agent',
-                            content: sessionStatus.last_content || '',
-                            status: 'Reconnecting...',
-                            type: 'streaming'
-                        });
-                        
-                        setCurrentMessages(formattedMessages);
-                    } catch (e) {
-                        console.warn('Failed to load existing messages:', e);
-                    }
-
-                    await reconnectToStream(currentThreadId);
-                } else {
-                    console.log('Session completed or none, thread already verified');
-                }
-            } catch (error) {
-                console.error('Failed to check session status:', error);
-            }
+             // ... logic moved to restoreFromUrl ...
         };
-
-        checkAndReconnect();
+        // checkAndReconnect();
     }, [currentThreadId, user?.id, reconnectToStream]);
+    */
 
     // Single unified URL ↔ state sync effect
     useEffect(() => {
@@ -872,9 +1141,12 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                                                 const updated = [...prev];
                                                 const streamingIdx = updated.findIndex(m => m.message_id === streamingSessionId && m.type === 'streaming');
                                                 if (streamingIdx !== -1) {
+                                                    // Only update status, keep reasoning from current session only
                                                     updated[streamingIdx] = {
                                                         ...updated[streamingIdx],
-                                                        status: message || `Running ${tool}...`
+                                                        status: message || `Running ${tool}...`,
+                                                        // Ensure reasoning is only from current session
+                                                        reasoning: hasReceivedReasoning ? accumulatedReasoning : undefined
                                                     };
                                                 }
                                                 return updated;
@@ -1214,19 +1486,19 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
     }, []);
 
     // Edit a message and trigger regeneration - stores versions like ChatGPT
-    const editMessage = useCallback(async (messageIndex: number, newContent: string) => {
+    const editMessage = useCallback(async (messageIndex: number, newContent: string, parentCheckpointIdOverride?: string) => {
         if (isLoading) return;
         
         // Get the message to edit
         const messageToEdit = currentMessages[messageIndex];
         if (!messageToEdit || messageToEdit.role !== 'user') return;
         
-        // Skip if content is the same
-        if (messageToEdit.content.trim() === newContent.trim()) return;
+        // Skip if content is the same - unless we are forcing a branch via override
+        if (!parentCheckpointIdOverride && messageToEdit.content.trim() === newContent.trim()) return;
         
-        // Get checkpoint ID from the message before the edited one (if available)
+        // Get checkpoint ID: prioritized explicit override, then previous message's checkpoint
         const previousMessage = messageIndex > 0 ? currentMessages[messageIndex - 1] : null;
-        const parentCheckpointId = previousMessage?.checkpoint_id;
+        const parentCheckpointId = parentCheckpointIdOverride || previousMessage?.checkpoint_id;
         
         // Find the corresponding agent response
         const agentMsgIndex = messageIndex + 1;
@@ -1333,7 +1605,11 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                     deep_research: deepResearch,
                     literature_survey: literatureSurvey,
                     persona,
-                    parent_checkpoint_id: parentCheckpointId
+                    parent_checkpoint_id: parentCheckpointId,
+                    // Edit versioning metadata
+                    edit_group_id: editGroupId,
+                    edit_version: newVersionIndex,
+                    original_message_index: messageIndex
                 }),
                 signal: abortControllerRef.current.signal
             });
@@ -1532,6 +1808,19 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         }
     }, [user?.id, currentThreadId, addUploadMessage]);
 
+    const getMessageMetadata = useCallback((message: Message, index: number): MessageMetadata => {
+        return {
+            messageId: message.message_id,
+            checkpointId: message.checkpoint_id,
+            // For user messages, the parent checkpoint is the one before it
+            parentCheckpointId: message.parent_checkpoint_id || (index > 0 ? currentMessages[index - 1]?.checkpoint_id : undefined),
+            timestamp: message.versions?.[message.currentVersionIndex || 0]?.timestamp,
+            editGroupId: message.editGroupId,
+            versionIndex: message.currentVersionIndex,
+            totalVersions: message.versions?.length
+        };
+    }, [currentMessages]);
+
     const value = useMemo<ThreadContextType>(() => ({
         threads,
         currentThreadId,
@@ -1539,6 +1828,8 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         checkpoints,
         isLoading,
         isLoadingThreads,
+        isReconnecting,
+        reconnectOnMount,
         deepResearch,
         literatureSurvey,
         persona,
@@ -1552,11 +1843,13 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         sendMessage,
         editMessage,
         setMessageVersion,
+        getMessageMetadata,
         startNewChat,
         setDeepResearch,
         setLiteratureSurvey,
         setPersona,
         setShowThinking,
+        setReconnectOnMount,
         fetchStateHistory,
         branchFromCheckpoint,
         stopStream,
@@ -1569,6 +1862,8 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         checkpoints,
         isLoading,
         isLoadingThreads,
+        isReconnecting,
+        reconnectOnMount,
         deepResearch,
         literatureSurvey,
         persona,
@@ -1582,11 +1877,13 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         sendMessage,
         editMessage,
         setMessageVersion,
+        getMessageMetadata,
         startNewChat,
         setDeepResearch,
         setLiteratureSurvey,
         setPersona,
         setShowThinking,
+        setReconnectOnMount,
         fetchStateHistory,
         branchFromCheckpoint,
         stopStream,

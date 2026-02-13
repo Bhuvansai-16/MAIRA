@@ -10,6 +10,17 @@ export interface Thread {
     fork_checkpoint_id?: string;
 }
 
+// Metadata for branching and editing messages
+export interface MessageMetadata {
+    messageId?: string;
+    checkpointId?: string;
+    parentCheckpointId?: string;
+    timestamp?: string;
+    editGroupId?: string;
+    versionIndex?: number;
+    totalVersions?: number;
+}
+
 // A single version of a message pair (user question + agent response)
 export interface MessageVersion {
     userContent: string;
@@ -42,6 +53,8 @@ export interface Message {
     versions?: MessageVersion[];  // All versions of this message pair
     currentVersionIndex?: number;  // Currently displayed version (0-based)
     editGroupId?: string;  // Links user message to its agent response
+    isEdit?: boolean;  // True if this message is an edit of a previous message
+    originalMessageIndex?: number;  // Original position in conversation before editing
 }
 
 export interface ActiveStep {
@@ -68,25 +81,29 @@ export interface ThreadContextType {
     checkpoints: CheckpointInfo[];
     isLoading: boolean;
     isLoadingThreads: boolean;
+    isReconnecting: boolean;  // Whether currently reconnecting to a stream
     deepResearch: boolean;
     literatureSurvey: boolean;
     persona: string;
     lastEventId: string | null;
     activeSteps: Record<string, ActiveStep>;  // Track active tool/subagent steps
     showThinking: boolean;  // Toggle thinking/reasoning display
+    reconnectOnMount: boolean;  // Flag to enable reconnect on mount
     // Actions
     createThread: (title?: string) => Promise<Thread>;
     selectThread: (threadId: string) => Promise<void>;
     deleteThread: (threadId: string) => Promise<void>;
     refreshThreads: () => Promise<void>;
     sendMessage: (prompt: string, parentCheckpointId?: string, attachments?: { name: string; type: 'file' | 'image' }[]) => Promise<void>;
-    editMessage: (messageIndex: number, newContent: string) => Promise<void>;
+    editMessage: (messageIndex: number, newContent: string, parentCheckpointId?: string) => Promise<void>;  // Enhanced with parentCheckpointId
     setMessageVersion: (messageIndex: number, versionIndex: number) => void;  // Navigate between versions
+    getMessageMetadata: (message: Message, messageIndex: number) => MessageMetadata;  // Get metadata for branching
     startNewChat: () => void;
     setDeepResearch: (enabled: boolean) => void;
     setLiteratureSurvey: (enabled: boolean) => void;
     setPersona: (persona: string) => void;
     setShowThinking: (show: boolean) => void;
+    setReconnectOnMount: (enabled: boolean) => void;  // Toggle reconnect on mount
     fetchStateHistory: (threadId: string) => Promise<CheckpointInfo[]>;
     branchFromCheckpoint: (checkpointId: string) => Promise<Thread | null>;
     stopStream: () => void;

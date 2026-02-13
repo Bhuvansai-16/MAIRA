@@ -1,4 +1,4 @@
-from tools.arxivertool import arxiv_tool
+from tools.arxivertool import arxiv_search  # Rate-limited version with retry logic
 from config import subagent_model
 from dotenv import load_dotenv
 load_dotenv()
@@ -12,14 +12,14 @@ Your responsibility is to find peer-reviewed evidence from the arXiv repository.
 
 PROCESS:
 1. Identify the CORE topic from the research request.
-2. Make AT MOST 3 arxiv searches total. Each query must be 2-5 keywords.
+2. Make AT MOST 3 arxiv_search calls total. Each query must be 2-5 keywords.
 3. Extract metadata for the top 3-5 most relevant results across all searches.
 
 CRITICAL RATE LIMIT RULES:
-- MAXIMUM 3 arxiv_tool calls per task. NO EXCEPTIONS.
+- MAXIMUM 3 arxiv_search calls per task. NO EXCEPTIONS.
 - DO NOT create a separate search for every subtopic — consolidate into broad queries.
-- Wait briefly between calls to avoid SSL/connection errors.
-- If a query fails with a connection error, STOP searching and return what you have.
+- The tool has built-in rate limiting and retry logic - trust it to handle API limits.
+- If a query fails after retries, STOP searching and return what you have.
 
 QUERY STRATEGY:
 - Use 1 broad query for the main topic, then 1-2 narrower queries if needed.
@@ -57,6 +57,6 @@ RULES:
 - Only report what is found in the database.
 - If no relevant papers are found after 2-3 attempts, state that clearly.
 """,
-    "tools": [arxiv_tool],
+    "tools": [arxiv_search],
     "model": subagent_model
 }

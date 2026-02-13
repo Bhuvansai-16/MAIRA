@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import { Plus, Send, Mic, MicOff, Sparkles, Shield, GitBranch, User, GraduationCap, Microscope, BookOpen, Square, Brain, FileText, Image as ImageIcon, X, Loader2 } from "lucide-react";
 import { useSpeechRecognition } from "../hooks/useSpeechRecognition";
 import { MessageBubble } from "./MessageBubble";
+import { DeepResearchProgress } from "./DeepResearchProgress";
 import { TimelineView } from "./TimelineView";
 import { ModelSelector } from "./ModelSelector";
 import { cn } from "../lib/utils";
@@ -216,38 +217,49 @@ export const ChatArea = () => {
                         </div>
                     ) : (
                         <div className="flex flex-col gap-8">
-                            {currentMessages.map((msg, index) => (
-                                <div 
-                                    key={msg.message_id || `${index}-${msg.currentVersionIndex || 0}`} 
-                                    className="animate-slide-up"
-                                >
-                                    <MessageBubble
-                                        role={msg.role}
-                                        content={msg.content}
-                                        thought={msg.thought}
-                                        status={msg.status}
-                                        attachments={msg.attachments}
-                                        download={msg.download}
-                                        verification={msg.verification}
-                                        reasoning={showThinking ? msg.reasoning : undefined}
-                                        messageIndex={index}
-                                        onEdit={editMessage}
-                                        isStreaming={msg.type === 'streaming'}
-                                        totalVersions={msg.versions?.length || 1}
-                                        currentVersionIndex={msg.currentVersionIndex || 0}
-                                        onVersionChange={setMessageVersion}
-                                    />
-                                </div>
-                            ))}
+                            {currentMessages.map((msg, index) => {
+                                // When deep research is active, hide the streaming placeholder
+                                // (DeepResearchProgress replaces it below)
+                                if (deepResearch && isLoading && msg.type === 'streaming') {
+                                    return null;
+                                }
+                                return (
+                                    <div 
+                                        key={msg.message_id || `${index}-${msg.currentVersionIndex || 0}`} 
+                                        className="animate-slide-up"
+                                    >
+                                        <MessageBubble
+                                            role={msg.role}
+                                            content={msg.content}
+                                            thought={msg.thought}
+                                            status={msg.status}
+                                            attachments={msg.attachments}
+                                            download={msg.download}
+                                            verification={msg.verification}
+                                            reasoning={showThinking ? msg.reasoning : undefined}
+                                            messageIndex={index}
+                                            onEdit={editMessage}
+                                            isStreaming={msg.type === 'streaming'}
+                                            totalVersions={msg.versions?.length || 1}
+                                            currentVersionIndex={msg.currentVersionIndex || 0}
+                                            onVersionChange={setMessageVersion}
+                                        />
+                                    </div>
+                                );
+                            })}
 
-                            {isLoading && currentMessages[currentMessages.length - 1]?.role === 'user' && (
+                            {/* Deep Research: show phased progress UI instead of plain MessageBubble */}
+                            {isLoading && deepResearch && currentMessages.some(m => m.type === 'streaming') && (
                                 <div className="animate-slide-up">
-                                    <MessageBubble
-                                        role="agent"
-                                        content=""
-                                        status="Thinking..."
-                                        isStreaming={true}
-                                    />
+                                    <div className="flex w-full items-start gap-5">
+                                        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border-2 border-white/10 bg-[#121212] text-white ring-offset-2 ring-offset-black shadow-xl ring-white/10">
+                                            <Shield size={18} strokeWidth={2.5} className="text-blue-500" />
+                                        </div>
+                                        <DeepResearchProgress
+                                            isActive={true}
+                                            status={currentMessages.find(m => m.type === 'streaming')?.status}
+                                        />
+                                    </div>
                                 </div>
                             )}
                         </div>

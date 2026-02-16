@@ -11,6 +11,7 @@ MAIRA is an AI-powered deep research platform that orchestrates multiple special
 - **Tier 2 — Informational**: Quick web searches, facts, and data lookups
 - **Tier 3 — Deep Research**: Full multi-agent orchestration with drafting, verification loops, and report generation
 - **Tier 4 — Literature Survey**: Structured academic literature reviews with LaTeX-to-PDF/DOCX generation
+- **Tier 5 — Paper Writer**: Full-featured LaTeX editor with AI assistance, live preview, and client-side export (PDF/DOCX)
 
 ### Specialized Agents
 | Agent | Responsibility |
@@ -25,6 +26,7 @@ MAIRA is an AI-powered deep research platform that orchestrates multiple special
 | **Summary** | Concise summary generation from draft outputs |
 | **Report** | Professional report formatting and export (PDF/DOCX) |
 | **Literature Survey** | LaTeX-based academic literature reviews → PDF/DOCX |
+| **Paper Writer** | Dedicated LaTeX editor with template selection and AI chat |
 | **GitHub** | Repository analysis (structure, tech stack, code review) via GitHub App |
 
 ### Multi-Model Support
@@ -320,6 +322,8 @@ The UI will be available at `http://localhost:5173`.
 | Lucide React | Icons |
 | Sonner | Toast notifications |
 | Axios | HTTP client |
+| jsPDF | Client-side PDF generation |
+| docx | Client-side Word document generation |
 
 ### Infrastructure & Middleware
 | Technology | Purpose |
@@ -349,6 +353,13 @@ Toggle "Literature Survey" for academic reviews:
 1. Agent searches arXiv for relevant papers
 2. Compiles structured LaTeX with comparison tables
 3. Generates PDF for download directly in the chat
+
+### Paper Writer
+Access the specialized writing environment for drafting papers:
+1. **Templates**: proper IEEE, Research Article, and Thesis templates
+2. **Editor**: Split-view editor with LaTeX syntax highlighting and live preview
+3. **AI Assistance**: Chat with the contextual AI to write sections, fix errors, or rephrase text
+4. **Export**: Instant client-side export to PDF and Word formats
 
 ### Document Upload
 Drag & drop or click to upload `.pdf`, `.doc`, `.docx` files. MAIRA automatically reads and indexes the content for RAG-powered Q&A. Uploaded documents are prioritized over web search results when answering questions.

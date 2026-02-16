@@ -215,6 +215,8 @@ def create_table_flowable(table_data: list[list[str]], styles, report_level: str
             cell_text = cell[:200] + '...' if len(cell) > 200 else cell
             # Handle line breaks in cells
             cell_text = cell_text.replace('\n', '<br/>')
+            # Sanitize stray HTML tags that would break ReportLab's XML parser
+            cell_text = process_markdown_formatting(cell_text)
             formatted_row.append(Paragraph(cell_text, style))
         formatted_data.append(formatted_row)
     
@@ -258,7 +260,21 @@ def process_markdown_formatting(text: str) -> str:
     """Convert Markdown formatting to ReportLab HTML.
     
     Uses non-greedy matching for better handling of multiple formatting markers.
+    Also sanitizes HTML to be valid XML for ReportLab's paragraph parser.
+    
+    Strategy: First escape ALL angle brackets (so stray HTML tags like <para>,
+    <div>, <p> etc. from LLM output don't break ReportLab's XML parser), then
+    apply our Markdown-to-XML conversions which produce only valid ReportLab tags.
     """
+    # --- Step 1: Preserve <br> tags via placeholder, then escape all < > ---
+    text = re.sub(r'<br\s*/?>', '\x00BR\x00', text, flags=re.IGNORECASE)
+    text = text.replace('<', '&lt;').replace('>', '&gt;')
+    text = text.replace('\x00BR\x00', '<br/>')
+    
+    # --- Step 2: Escape bare & that aren't already part of an HTML entity ---
+    text = re.sub(r'&(?!amp;|lt;|gt;|quot;|apos;|#)', '&amp;', text)
+    
+    # --- Step 3: Convert Markdown formatting to ReportLab XML tags ---
     # **bold** → <b>bold</b> (non-greedy)
     text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
     # *italic* → <i>italic</i> (non-greedy, exclude asterisks in content)
@@ -270,46 +286,55 @@ def process_markdown_formatting(text: str) -> str:
 
 def process_content_with_tables(content: str, styles, report_level: str) -> list:
     """
-    Process content that may contain Markdown tables and formatting.
-    Returns a list of flowables (Paragraphs and Tables).
+    Process content with proper paragraph grouping and Markdown support.
+    Consecutive regular text lines are joined into flowing paragraphs for
+    proper justification, while bullets, headings, tables and images remain
+    as separate flowables.
     """
     flowables = []
-    
-    # More robust table detection: find tables by looking for header + separator pattern
-    # then greedily consume all following lines that look like table rows
+
+    # Normalize line breaks
+    content = re.sub(r'\r\n', '\n', content)
+    content = re.sub(r'<br\s*/?>', '\n', content, flags=re.IGNORECASE)
     lines = content.split('\n')
+
     i = 0
-    
+    current_para_lines = []  # Accumulate regular text lines for proper paragraphs
+
+    def flush_paragraph():
+        """Join accumulated lines into a single justified paragraph."""
+        if current_para_lines:
+            para_text = ' '.join(current_para_lines).strip()
+            if para_text:
+                para_text = process_markdown_formatting(para_text)
+                flowables.append(Paragraph(para_text, styles['LevelBody']))
+                flowables.append(Spacer(1, 6))
+            current_para_lines.clear()
+
     while i < len(lines):
         line = lines[i].strip()
-        
-        # Check if this could be the start of a table (line with | characters)
+        raw_line = lines[i]  # Keep original for indentation-aware detection
+
+        # ── Table detection ──
         if line.startswith('|') and line.endswith('|') and line.count('|') >= 2:
-            # Look ahead for separator line
             if i + 1 < len(lines):
                 next_line = lines[i + 1].strip()
-                # Check if it's a separator (|---|---|)
                 if re.match(r'^\|[\s\-:|]+\|$', next_line.replace(' ', '')):
-                    # Found a table! Collect all table rows
+                    flush_paragraph()
                     table_lines = [line, next_line]
                     j = i + 2
                     while j < len(lines):
                         row_line = lines[j].strip()
-                        # Continue if line starts with | (table row)
                         if row_line.startswith('|'):
-                            # Ensure it ends with | or add it
                             if not row_line.endswith('|'):
                                 row_line += ' |'
                             table_lines.append(row_line)
                             j += 1
                         elif row_line == '':
-                            # Empty line might be part of table, check next
                             j += 1
                         else:
-                            # Non-table line, stop
                             break
-                    
-                    # Parse and render the table
+
                     table_text = '\n'.join(table_lines)
                     table_data = parse_markdown_table(table_text)
                     if table_data and len(table_data) > 1:
@@ -318,86 +343,112 @@ def process_content_with_tables(content: str, styles, report_level: str) -> list
                             flowables.append(Spacer(1, 12))
                             flowables.append(table)
                             flowables.append(Spacer(1, 12))
-                    
+
                     i = j
                     continue
-        
-        # Not a table - process as regular content
-        if line:
-            # Check for image markdown: ![caption](url)
-            img_match = re.match(r'^!\[([^\]]*)\]\(([^\)]+)\)$', line)
-            if img_match:
-                caption = img_match.group(1)
-                img_url = img_match.group(2)
-                try:
-                    # Download image from URL
-                    response = requests.get(img_url, timeout=10, headers={
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                    })
-                    if response.status_code == 200:
-                        img_data = io.BytesIO(response.content)
-                        # Create ReportLab Image (scaled to fit page width, max 5x3.5 inches)
-                        try:
-                            img = Image(img_data, width=5*inch, height=3.5*inch, kind='proportional')
-                            flowables.append(Spacer(1, 12))
-                            flowables.append(img)
-                            if caption:
-                                # Add caption below image
-                                flowables.append(Spacer(1, 6))
-                                flowables.append(Paragraph(f"<i>Fig: {caption}</i>", styles['Italic']))
-                            flowables.append(Spacer(1, 12))
-                        except Exception as img_err:
-                            print(f"Failed to create image flowable: {img_err}")
-                    else:
-                        print(f"Failed to download image (HTTP {response.status_code}): {img_url}")
-                except Exception as e:
-                    print(f"Failed to include image {img_url}: {e}")
-                i += 1
-                continue
-            
-            # Handle bullet points
-            if line.startswith('- ') or line.startswith('• '):
-                para_text = line[2:]
-                para_text = process_markdown_formatting(para_text)
-                flowables.append(Paragraph('• ' + para_text, styles['LevelBullet']))
-            elif re.match(r'^\d+\.\s', line):
-                # Numbered list item
-                num_match = re.match(r'^(\d+)\.\s+(.*)', line)
-                if num_match:
-                    num = num_match.group(1)
-                    text = process_markdown_formatting(num_match.group(2))
+
+        # ── Image markdown: ![caption](url) ──
+        img_match = re.match(r'^!\[([^\]]*)\]\(([^\)]+)\)$', line)
+        if img_match:
+            flush_paragraph()
+            caption = img_match.group(1)
+            img_url = img_match.group(2)
+            try:
+                response = requests.get(img_url, timeout=10, headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                })
+                if response.status_code == 200:
+                    img_data = io.BytesIO(response.content)
+                    try:
+                        img = Image(img_data, width=5*inch, height=3.5*inch, kind='proportional')
+                        flowables.append(Spacer(1, 12))
+                        flowables.append(img)
+                        if caption:
+                            flowables.append(Spacer(1, 6))
+                            flowables.append(Paragraph(f"<i>Fig: {caption}</i>", styles['Italic']))
+                        flowables.append(Spacer(1, 12))
+                    except Exception as img_err:
+                        print(f"Failed to create image flowable: {img_err}")
+                else:
+                    print(f"Failed to download image (HTTP {response.status_code}): {img_url}")
+            except Exception as e:
+                print(f"Failed to include image {img_url}: {e}")
+            i += 1
+            continue
+
+        # ── Headings ──
+        if line.startswith('#'):
+            flush_paragraph()
+            heading_match = re.match(r'^(#+)\s*(.*)', line)
+            if heading_match:
+                text = heading_match.group(2).strip()
+                flowables.append(Paragraph(text, styles['SectionHeading']))
+                flowables.append(Spacer(1, 12))
+            i += 1
+            continue
+
+        # ── Bullet / numbered lists ──
+        stripped = raw_line.lstrip()
+        if stripped.startswith(('- ', '• ', '* ')) or re.match(r'^\d+\.\s', stripped):
+            flush_paragraph()
+            if stripped.startswith(('- ', '• ', '* ')):
+                bullet_text = stripped[2:].strip()
+                bullet_text = process_markdown_formatting(bullet_text)
+                flowables.append(Paragraph('• ' + bullet_text, styles['LevelBullet']))
+            elif re.match(r'^\d+\.\s', stripped):
+                match = re.match(r'^(\d+)\.\s+(.*)', stripped)
+                if match:
+                    num = match.group(1)
+                    text = process_markdown_formatting(match.group(2))
                     flowables.append(Paragraph(f'{num}. {text}', styles['LevelBullet']))
-            elif line.startswith('#'):
-                # Heading
-                heading_match = re.match(r'^(#+)\s*(.*)', line)
-                if heading_match:
-                    level = len(heading_match.group(1))
-                    text = heading_match.group(2)
-                    flowables.append(Paragraph(text, styles['SectionHeading']))
-            else:
-                # Regular paragraph
-                para_text = process_markdown_formatting(line)
-                flowables.append(Paragraph(para_text, styles['LevelBody']))
-            
             flowables.append(Spacer(1, 4))
-        
+            i += 1
+            continue
+
+        # ── Empty line → flush current paragraph, add spacing ──
+        if not line:
+            flush_paragraph()
+            flowables.append(Spacer(1, 8))
+            i += 1
+            continue
+
+        # ── Regular text → accumulate for paragraph grouping ──
+        current_para_lines.append(line)
         i += 1
-    
+
+    flush_paragraph()  # Final flush
     return flowables
 
 
 def create_cover_page(report_title: str, report_level: str, styles) -> list:
-    """Create a professional cover page based on report level."""
+    """Create a professional cover page with better title wrapping."""
     cover = []
-    
-    # Vertical spacing
-    cover.append(Spacer(1, 2 * inch))
-    
-    # Title
-    cover.append(Paragraph(report_title, styles['CoverTitle']))
-    cover.append(Spacer(1, 0.5 * inch))
-    
-    # Subtitle based on level
+    cover.append(Spacer(1, 2.5 * inch))
+
+    level_colors = get_level_colors(report_level)
+
+    # Split long titles at colon for better wrapping
+    if ':' in report_title:
+        parts = report_title.split(':', 1)
+        main_title = parts[0].strip() + ':'
+        sub_title_text = parts[1].strip()
+
+        cover.append(Paragraph(main_title, styles['CoverTitle']))
+        cover.append(Spacer(1, 0.3 * inch))
+
+        sub_style = ParagraphStyle(
+            'CoverTitleSub',
+            parent=styles['CoverTitle'],
+            fontSize=28 if report_level == "student" else 24,
+            leading=32 if report_level == "student" else 28,
+            alignment=TA_CENTER
+        )
+        cover.append(Paragraph(sub_title_text, sub_style))
+    else:
+        cover.append(Paragraph(report_title, styles['CoverTitle']))
+
+    cover.append(Spacer(1, 0.8 * inch))
+
     level_subtitles = {
         "student": "An Educational Guide",
         "professor": "A Teaching Resource",
@@ -405,17 +456,14 @@ def create_cover_page(report_title: str, report_level: str, styles) -> list:
     }
     subtitle = level_subtitles.get(report_level, "Report")
     cover.append(Paragraph(subtitle, styles['CoverSubtitle']))
-    cover.append(Spacer(1, 0.3 * inch))
-    
-    # Date and generator
+    cover.append(Spacer(1, 0.5 * inch))
+
     date_text = f"Generated: {datetime.now().strftime('%B %d, %Y')}"
     cover.append(Paragraph(date_text, styles['Italic']))
-    cover.append(Spacer(1, 6))
+    cover.append(Spacer(1, 12))
     cover.append(Paragraph("MAIRA Research Agent", styles['Italic']))
-    
-    # Page break
+
     cover.append(PageBreak())
-    
     return cover
 
 
@@ -447,6 +495,11 @@ def export_to_pdf(
     clean_filename = filename.lstrip("/\\").replace(" ", "_")
     if not clean_filename.lower().endswith(".pdf"):
         clean_filename += ".pdf"
+    # If still using the generic default, generate a descriptive filename from the title
+    if clean_filename == "MAIRA_Report.pdf":
+        slug = re.sub(r'[^\w\s-]', '', report_title).strip()
+        slug = re.sub(r'[\s]+', '_', slug)[:80]  # Limit length
+        clean_filename = f"{slug}_Report.pdf" if slug else clean_filename
 
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -455,7 +508,9 @@ def export_to_pdf(
         topMargin=72,
         bottomMargin=72,
         leftMargin=72,
-        rightMargin=72
+        rightMargin=72,
+        title=report_title,
+        author="MAIRA Research Agent",
     )
     
     story = []
@@ -493,6 +548,6 @@ def export_to_pdf(
         
         print(f"  📄 PDF generated: {clean_filename} ({pdf_size_kb:.1f} KB)")
         
-        return f'[DOWNLOAD_PDF]{{"filename": "{clean_filename}", "data": "{pdf_base64}"}}'
+        return f'[DOWNLOAD_PDF]{{"filename": "{clean_filename}", "status": "stored"}}'
     except Exception as e:
         return f"PDF generation error: {str(e)}"

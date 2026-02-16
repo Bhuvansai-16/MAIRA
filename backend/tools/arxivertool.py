@@ -68,19 +68,21 @@ class RateLimitedArxivWrapper:
                 return "\n\n".join(results)
                 
             except arxiv.HTTPError as e:
-                if e.status == 429:
+                # Handle rate limits (429) and server errors (5xx)
+                if e.status == 429 or (500 <= e.status < 600):
                     wait_time = self.delay_seconds * (self.backoff_factor ** attempt)
-                    print(f"Rate limited (429). Waiting {wait_time:.1f}s before retry {attempt + 1}/{self.max_retries}")
+                    print(f"arXiv API Error ({e.status}). Waiting {wait_time:.1f}s before retry {attempt + 1}/{self.max_retries}")
                     time.sleep(wait_time)
                 else:
-                    raise
+                    return f"arXiv API returned error {e.status}: {str(e)}"
             except Exception as e:
                 if attempt == self.max_retries - 1:
                     return f"Error searching arXiv after {self.max_retries} attempts: {str(e)}"
                 wait_time = self.delay_seconds * (self.backoff_factor ** attempt)
+                print(f"arXiv unknown error: {str(e)}. Retrying in {wait_time:.1f}s...")
                 time.sleep(wait_time)
         
-        return "Failed to retrieve papers due to rate limiting. Please try again in a few minutes."
+        return "Failed to retrieve papers from arXiv. The service might be temporarily unavailable."
 
 
 @tool

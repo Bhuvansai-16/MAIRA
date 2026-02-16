@@ -503,7 +503,7 @@ def assess_content_quality(draft_content: str) -> Dict[str, Any]:
     )
     
     # Generate recommendations
-    if results["overall_score"] >= 85:
+    if results["overall_score"] >= 80:
         results["status"] = "valid"
         results["recommendations"].append("Draft meets quality standards - ready for final report")
     elif results["overall_score"] >= 60:

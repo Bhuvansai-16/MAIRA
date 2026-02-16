@@ -1,5 +1,7 @@
 from tools.arxivertool import arxiv_search  # Rate-limited version with retry logic
 from config import subagent_model
+from langchain.agents.middleware import ModelFallbackMiddleware, ModelRetryMiddleware
+from config import gemini_2_5_pro, claude_3_5_sonnet_aws
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -58,5 +60,13 @@ RULES:
 - If no relevant papers are found after 2-3 attempts, state that clearly.
 """,
     "tools": [arxiv_search],
-    "model": subagent_model
+    "model": subagent_model,
+    "middleware": [
+        # Fallback specifically for this subagent
+        ModelFallbackMiddleware(
+            gemini_2_5_pro, # First fallback
+            claude_3_5_sonnet_aws       # Second fallback
+        ),
+        ModelRetryMiddleware(max_retries=2)
+    ]
 }

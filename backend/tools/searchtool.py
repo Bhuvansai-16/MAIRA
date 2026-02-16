@@ -17,6 +17,7 @@ def internet_search(
     """
     Run a web search to find real-time information, news, data, and relevant images.
     Returns search results including image URLs when available.
+    For literature survey only search for research papers
     """
     print(f"Running internet search for: {query}")
     return tavily_client.search(
@@ -25,4 +26,6 @@ def internet_search(
         topic=topic,
         include_answer="advanced",
         search_depth="advanced",
+        include_images=True,
+        include_image_descriptions=True,
     )

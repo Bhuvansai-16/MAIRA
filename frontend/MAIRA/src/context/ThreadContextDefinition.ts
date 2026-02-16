@@ -1,6 +1,13 @@
 import { createContext } from 'react';
 import type { VerificationData, CheckpointInfo } from '../types/agent';
 
+export interface CustomPersona {
+    persona_id: string;
+    name: string;
+    instructions: string;
+    created_at?: string;
+}
+
 export interface Thread {
     thread_id: string;
     title: string;
@@ -40,9 +47,11 @@ export interface Message {
     thought?: string;
     reasoning?: string;  // For reasoning/thinking blocks
     status?: string;
+    progress?: number;
     type?: 'streaming' | 'final';
     message_id?: string;  // For editing messages
     checkpoint_id?: string;  // For time travel
+    parent_checkpoint_id?: string; // For branching
     attachments?: { name: string; type: 'file' | 'image' }[];  // Uploaded file references
     download?: {
         filename: string;
@@ -67,8 +76,8 @@ export interface ActiveStep {
 export interface BackendMessage {
     type?: string;
     role?: string;
-    content: string | Array<{ type: string; text?: string; [key: string]: unknown }>;
-    tool_calls?: Array<{ name: string; [key: string]: unknown }>;
+    content: string | Array<{ type: string; text?: string;[key: string]: unknown }>;
+    tool_calls?: Array<{ name: string;[key: string]: unknown }>;
     [key: string]: unknown;
 }
 
@@ -85,6 +94,8 @@ export interface ThreadContextType {
     deepResearch: boolean;
     literatureSurvey: boolean;
     persona: string;
+    sites: string[];  // Restrict search to specific domains
+    isSiteRestrictionEnabled: boolean; // Whether site restriction is active
     lastEventId: string | null;
     activeSteps: Record<string, ActiveStep>;  // Track active tool/subagent steps
     showThinking: boolean;  // Toggle thinking/reasoning display
@@ -102,6 +113,16 @@ export interface ThreadContextType {
     setDeepResearch: (enabled: boolean) => void;
     setLiteratureSurvey: (enabled: boolean) => void;
     setPersona: (persona: string) => void;
+    setSites: (sites: string[]) => void;
+    setIsSiteRestrictionEnabled: (enabled: boolean) => void; // Toggle restriction without clearing sites
+    // Custom personas
+    customPersonas: CustomPersona[];
+    addCustomPersona: (name: string, instructions: string) => Promise<void>;
+    deleteCustomPersona: (personaId: string) => Promise<void>;
+    getCustomPersonaInstructions: (personaId: string) => string | null;
+    // Persisted sites
+    loadSavedSites: () => Promise<void>;
+    saveSites: (sites: string[]) => Promise<void>;
     setShowThinking: (show: boolean) => void;
     setReconnectOnMount: (enabled: boolean) => void;  // Toggle reconnect on mount
     fetchStateHistory: (threadId: string) => Promise<CheckpointInfo[]>;

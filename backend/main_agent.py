@@ -6,9 +6,7 @@ from subagents.websearch_subagent import websearch_subagent
 from subagents.paper_agent import academic_paper_subagent
 from subagents.draft_agent import draft_subagent
 from subagents.report_agent import report_subagent
-from subagents.validation_subagent import validation_subagent
-from subagents.fact_checking_subagent import fact_checking_subagent
-from subagents.quality_checking_subagent import quality_checking_subagent
+from subagents.deep_reasoning_agent import deep_reasoning_subagent
 from subagents.literature_agent import literature_survey_subagent
 from subagents.github_subagent import github_subagent
 from tools.searchtool import internet_search
@@ -269,26 +267,24 @@ FULL RESEARCH WORKFLOW (Tier 3)
 1. Planning → call write_todos
 2. Discovery → call websearch-agent(also can extract webpage content) AND academic-paper-agent in parallel
 3. Drafting → call draft-subagent (SAVE output)
-4. Verification → call ALL THREE verification subagents after drafting:
-   - `validation-agent`: Checks citations format, URL accessibility, completeness
-   - `fact-checking-agent`: Verifies factual claims against sources
-   - `quality-checking-agent`: Assesses content quality and source utilization
+4. Verification → call `deep-reasoning-agent` after drafting:
+   - This single agent performs ALL verification: citation validation, fact-checking, completeness, content quality, and source cross-referencing
+   - It returns a unified verification report with an OVERALL SCORE and STATUS (VALID / NEEDS_REVISION / INVALID)
    
    ## Verification Loop Rules (CRITICAL - PREVENT INFINITE LOOPS):
    - Track revision_count internally (starts at 0)
    - **HARD CAP: Maximum 3 revision attempts**
-   - Run all 3 verification agents (can be parallel or sequential)
    
    **Decision Logic:**
    ```
-   IF all agents approve (no critical issues):
+   IF deep-reasoning-agent returns STATUS: VALID:
        → Proceed to Summary (Step 5)
    
-   ELIF revision_count < 3 AND critical issues found:
+   ELIF revision_count < 3 AND STATUS is NEEDS_REVISION or INVALID:
        → revision_count += 1
        → Call `write_todos` to add task: "Revision #[count]: Fix [issues]"
-       → Re-invoke `draft-subagent` with specific feedback
-       → Re-run verification agents
+       → Re-invoke `draft-subagent` with specific feedback from the report
+       → Re-run `deep-reasoning-agent`
    
    ELIF revision_count >= 3:
        → STOP REVISING - proceed to Summary with LOW CONFIDENCE flag
@@ -394,7 +390,7 @@ Optional PERSONA (applies only to DEEP_RESEARCH and LITERATURE_SURVEY):
 - Default: balanced
 - STUDENT: clear & simple
 - PROFESSOR: rigorous & formal
-- RESEARCHER: technical depth & novelty
+- RESEARCHER: technical depth & novelty & Reseach gaps & comparision tables.
 
 RULES:
 - Strictly follow MODE
@@ -431,12 +427,29 @@ TIER 3 WORKFLOW (DEEP_RESEARCH)
 1. Planning → call write_todos
 2. Discovery → parallel calls: websearch-agent (incl. webpage extraction) + academic-paper-agent
 3. Drafting → call draft-subagent (save output)
-4. Verification → call validation-agent, fact-checking-agent, quality-checking-agent
-   - Track revision_count (starts at 0)
-   - If gaps found: 
-     • write_todos: mark Drafting "in_progress" + add task for gaps
-     • Re-call draft-subagent with feedback and update the draft
-   - Repeat until approved
+4. Verification → call `deep-reasoning-agent` after drafting:
+   - This single agent performs ALL verification: citation validation, fact-checking, completeness, content quality, and source cross-referencing
+   - It returns a unified report with OVERALL SCORE and STATUS (VALID / NEEDS_REVISION / INVALID)
+   
+   ## Verification Loop Rules (CRITICAL - PREVENT INFINITE LOOPS):
+   - Track revision_count internally (starts at 0)
+   - **HARD CAP: Maximum 3 revision attempts**
+   
+   **Decision Logic:**
+   ```
+   IF deep-reasoning-agent returns STATUS: VALID:
+       → Proceed to Summary (Step 5)
+   
+   ELIF revision_count < 3 AND STATUS is NEEDS_REVISION or INVALID:
+       → revision_count += 1
+       → Call `write_todos` to add task: "Revision #[count]: Fix [issues]"
+       → Re-invoke `draft-subagent` with specific feedback from the report
+       → Re-run `deep-reasoning-agent`
+   
+   ELIF revision_count >= 3:
+       → STOP REVISING - proceed to Summary with LOW CONFIDENCE flag
+       → Add warning to final output: "⚠️ Note: This report may contain unverified claims after 3 revision attempts."
+   ```
 5. Summary of the draft - call summary-agent to generate a concise summary of the draft output. This will be included in the final response.
 6. Report → call report-subagent (capture download marker)
 7. Final response: summary from summary-agent and report from report-subagent (with download marker).
@@ -479,13 +492,15 @@ FINAL RESPONSE (Tier 3 & 4)
 - Tone: formal, professional, research-oriented
 - Include any relevant images found during the search if applicable
 """
+skills_prompt = """
+You are the MAIRA Lead Research agent. Load your main-agent skill to identify the correct tier and workflow for the user's request.
+
+"""
 subagents = [ 
     websearch_subagent, 
     academic_paper_subagent, 
     draft_subagent, 
-    validation_subagent,
-    fact_checking_subagent,
-    quality_checking_subagent,
+    deep_reasoning_subagent,
     report_subagent,
     literature_survey_subagent,
     github_subagent,
@@ -510,20 +525,19 @@ print("✅ PostgresSaver checkpointer ready")
 agent = create_deep_agent(
     subagents=subagents,
     model=main_agent_model,
-      middleware=[
-        ModelFallbackMiddleware(
-            gemini_2_5_pro,
-            claude_3_5_sonnet_aws,
-        ),
-        ModelRetryMiddleware(
-            max_retries=3,
-            backoff_factor=3.0,
-            initial_delay=5.0,
-        ),
+    middleware=[
+      ModelFallbackMiddleware(
+         gemini_2_5_pro,
+         claude_3_5_sonnet_aws,
+      ),
+      ModelRetryMiddleware(
+         max_retries=3,
+      ),
     ],
     tools=tools,
     system_prompt=prompt_v2,
     checkpointer=checkpointer,
+    # skills = ["./skills/main-agent"] 
 )
 
 print("✅ Agent initialized with PostgresCheckpointer")

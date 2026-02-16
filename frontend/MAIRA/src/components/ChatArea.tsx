@@ -1,12 +1,15 @@
 import { useState, useRef, useEffect } from "react";
-import { Plus, Send, Mic, MicOff, Sparkles, Shield, GitBranch, User, GraduationCap, Microscope, BookOpen, Square, Brain, FileText, Image as ImageIcon, X, Loader2 } from "lucide-react";
+import { Plus, Send, Mic, MicOff, Sparkles, Shield, GitBranch, BookOpen, Square, FileText, Image as ImageIcon, X, Loader2, Home } from "lucide-react";
 import { useSpeechRecognition } from "../hooks/useSpeechRecognition";
 import { MessageBubble } from "./MessageBubble";
 import { DeepResearchProgress } from "./DeepResearchProgress";
 import { TimelineView } from "./TimelineView";
 import { ModelSelector } from "./ModelSelector";
+import { SitesSelector } from "./SitesSelector";
+import { PersonaDropdown } from "./PersonaDropdown";
 import { cn } from "../lib/utils";
 import { useThreads } from "../hooks/useThreads";
+import { useNavigate } from "react-router-dom";
 
 type AttachmentStatus = 'uploading' | 'success' | 'error';
 
@@ -19,7 +22,8 @@ interface Attachment {
 }
 
 export const ChatArea = () => {
-    const { currentMessages, isLoading, sendMessage, stopStream, currentThreadId, deepResearch, setDeepResearch, literatureSurvey, setLiteratureSurvey, editMessage, setMessageVersion, persona, setPersona, showThinking, setShowThinking, uploadFile, uploadImage } = useThreads();
+    const { currentMessages, isLoading, sendMessage, stopStream, currentThreadId, deepResearch, setDeepResearch, literatureSurvey, setLiteratureSurvey, editMessage, setMessageVersion, persona, setPersona, sites, setSites, uploadFile, uploadImage, customPersonas, addCustomPersona, deleteCustomPersona, saveSites, isSiteRestrictionEnabled, setIsSiteRestrictionEnabled } = useThreads();
+    const navigate = useNavigate();
     const [input, setInput] = useState("");
     const [attachments, setAttachments] = useState<Attachment[]>([]);
     const [isTimelineOpen, setIsTimelineOpen] = useState(false);
@@ -35,7 +39,7 @@ export const ChatArea = () => {
     const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
         if (!file) return;
-        
+
         setShowAttachMenu(false);
 
         const newAttachment: Attachment = {
@@ -49,16 +53,16 @@ export const ChatArea = () => {
 
         try {
             await uploadFile(file);
-            setAttachments(prev => prev.map(a => 
+            setAttachments(prev => prev.map(a =>
                 a.id === newAttachment.id ? { ...a, status: 'success' } : a
             ));
         } catch (error) {
             console.error(error);
-            setAttachments(prev => prev.map(a => 
+            setAttachments(prev => prev.map(a =>
                 a.id === newAttachment.id ? { ...a, status: 'error' } : a
             ));
         }
-        
+
         // Reset input
         if (fileInputRef.current) fileInputRef.current.value = "";
     };
@@ -66,7 +70,7 @@ export const ChatArea = () => {
     const handleImageSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
         if (!file) return;
-        
+
         setShowAttachMenu(false);
 
         const previewUrl = URL.createObjectURL(file);
@@ -82,12 +86,12 @@ export const ChatArea = () => {
 
         try {
             await uploadImage(file);
-            setAttachments(prev => prev.map(a => 
+            setAttachments(prev => prev.map(a =>
                 a.id === newAttachment.id ? { ...a, status: 'success' } : a
             ));
         } catch (error) {
             console.error(error);
-            setAttachments(prev => prev.map(a => 
+            setAttachments(prev => prev.map(a =>
                 a.id === newAttachment.id ? { ...a, status: 'error' } : a
             ));
         }
@@ -124,7 +128,7 @@ export const ChatArea = () => {
         const successAttachments = attachments
             .filter(a => a.status === 'success')
             .map(a => ({ name: a.file.name, type: a.type }));
-        
+
         setInput(""); // Clear input early
         setAttachments([]); // Clear attachment chips
         await sendMessage(userMessage, undefined, successAttachments.length > 0 ? successAttachments : undefined);
@@ -148,6 +152,13 @@ export const ChatArea = () => {
             {/* Header */}
             <header className="flex h-[72px] items-center justify-between border-b border-white/5 bg-black/20 backdrop-blur-2xl px-8 sticky top-0 z-20">
                 <div className="flex items-center gap-4">
+                    <button
+                        onClick={() => navigate('/')}
+                        className="flex h-10 w-10 items-center justify-center rounded-full bg-white/5 border border-white/10 text-neutral-400 hover:text-white hover:bg-white/10 transition-all group"
+                        title="Back to Home"
+                    >
+                        <Home size={18} className="group-hover:scale-110 transition-transform" />
+                    </button>
                     <div className="flex flex-col">
                         <h1 className="text-sm font-bold text-white tracking-tight">
                             {currentThreadId ? "Research Session" : "New Research"}
@@ -224,8 +235,8 @@ export const ChatArea = () => {
                                     return null;
                                 }
                                 return (
-                                    <div 
-                                        key={msg.message_id || `${index}-${msg.currentVersionIndex || 0}`} 
+                                    <div
+                                        key={msg.message_id || `${index}-${msg.currentVersionIndex || 0}`}
                                         className="animate-slide-up"
                                     >
                                         <MessageBubble
@@ -236,7 +247,7 @@ export const ChatArea = () => {
                                             attachments={msg.attachments}
                                             download={msg.download}
                                             verification={msg.verification}
-                                            reasoning={showThinking ? msg.reasoning : undefined}
+                                            // reasoning feature removed per user request
                                             messageIndex={index}
                                             onEdit={editMessage}
                                             isStreaming={msg.type === 'streaming'}
@@ -258,6 +269,7 @@ export const ChatArea = () => {
                                         <DeepResearchProgress
                                             isActive={true}
                                             status={currentMessages.find(m => m.type === 'streaming')?.status}
+                                            progress={currentMessages.find(m => m.type === 'streaming')?.progress}
                                         />
                                     </div>
                                 </div>
@@ -287,7 +299,7 @@ export const ChatArea = () => {
                                                 <FileText size={20} />
                                             </div>
                                         )}
-                                        
+
                                         <div className="flex flex-col min-w-[60px] max-w-[180px]">
                                             <span className="text-xs text-white truncate font-medium" title={attachment.file.name}>
                                                 {attachment.file.name}
@@ -308,7 +320,7 @@ export const ChatArea = () => {
                                         </div>
 
                                         {/* Remove Button */}
-                                        <button 
+                                        <button
                                             onClick={() => removeAttachment(attachment.id)}
                                             className="absolute -top-2 -right-2 p-1 rounded-full bg-neutral-800 text-neutral-400 hover:text-white border border-neutral-700 shadow-md opacity-0 group-hover/attachment:opacity-100 transition-all hover:bg-red-500/20 hover:border-red-500/50 hover:text-red-400"
                                         >
@@ -321,9 +333,9 @@ export const ChatArea = () => {
 
                         {/* Glow effect on focus */}
                         <div className="absolute -inset-0.5 bg-gradient-to-r from-violet-600 to-indigo-600 rounded-full opacity-20 group-focus-within/input:opacity-100 blur transition-all duration-500" />
-                        
+
                         <div className="relative z-20 flex items-center gap-2 rounded-full border border-violet-500/30 bg-[#0A0A0A] p-2 shadow-2xl shadow-violet-900/20 backdrop-blur-xl transition-all duration-300 group-focus-within/input:border-violet-500/80 group-focus-within/input:shadow-violet-500/20">
-                            
+
                             {/* Attachment Button */}
                             <div className="relative">
                                 <button
@@ -364,19 +376,19 @@ export const ChatArea = () => {
                                         </button>
                                     </div>
                                 )}
-                                
-                                <input 
-                                    type="file" 
-                                    ref={fileInputRef} 
-                                    className="hidden" 
+
+                                <input
+                                    type="file"
+                                    ref={fileInputRef}
+                                    className="hidden"
                                     accept=".pdf,.txt,.md,.csv,.json,.doc,.docx"
                                     onChange={handleFileSelect}
                                     aria-label="Upload document"
                                 />
-                                <input 
-                                    type="file" 
-                                    ref={imageInputRef} 
-                                    className="hidden" 
+                                <input
+                                    type="file"
+                                    ref={imageInputRef}
+                                    className="hidden"
                                     accept="image/png,image/jpeg,image/webp,image/gif"
                                     onChange={handleImageSelect}
                                     aria-label="Upload image"
@@ -437,18 +449,18 @@ export const ChatArea = () => {
                     </div>
 
                     {/* Controls Row (Below Bar) */}
-                    <div className="flex flex-wrap items-center justify-between gap-4 px-2">
+                    <div className="flex flex-nowrap items-center justify-between gap-4 px-2">
                         {/* Model Selector */}
                         <ModelSelector />
 
                         {/* Research Toggles */}
-                        <div className="flex items-center gap-2 overflow-x-auto pb-1 scrollbar-hide no-scrollbar mask-gradient-right">
-                             {/* Deep Research */}
-                             <button
+                        <div className="flex items-center gap-2 overflow-x-auto pb-1 min-w-0 scrollbar-hide no-scrollbar mask-gradient-right">
+                            {/* Deep Research */}
+                            <button
                                 onClick={() => setDeepResearch(!deepResearch)}
                                 className={cn(
                                     "flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-[10px] font-bold uppercase tracking-wider transition-all whitespace-nowrap select-none",
-                                     deepResearch
+                                    deepResearch
                                         ? "bg-blue-500/10 border-blue-500/30 text-blue-400"
                                         : "bg-white/5 border-white/5 text-neutral-500 hover:bg-white/10 hover:text-white"
                                 )}
@@ -456,13 +468,13 @@ export const ChatArea = () => {
                                 <Sparkles size={12} />
                                 <span>Deep Research</span>
                             </button>
-                            
+
                             {/* Lit Survey */}
                             <button
                                 onClick={() => setLiteratureSurvey(!literatureSurvey)}
                                 className={cn(
                                     "flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-[10px] font-bold uppercase tracking-wider transition-all whitespace-nowrap select-none",
-                                     literatureSurvey
+                                    literatureSurvey
                                         ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400"
                                         : "bg-white/5 border-white/5 text-neutral-500 hover:bg-white/10 hover:text-white"
                                 )}
@@ -471,42 +483,25 @@ export const ChatArea = () => {
                                 <span>Survey</span>
                             </button>
 
-                            {/* Thinking Toggle */}
-                            <button
-                                onClick={() => setShowThinking(!showThinking)}
-                                className={cn(
-                                    "flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-[10px] font-bold uppercase tracking-wider transition-all whitespace-nowrap select-none",
-                                     showThinking
-                                        ? "bg-purple-500/10 border-purple-500/30 text-purple-400"
-                                        : "bg-white/5 border-white/5 text-neutral-500 hover:bg-white/10 hover:text-white"
-                                )}
-                            >
-                                <Brain size={12} />
-                                <span>Thinking</span>
-                            </button>
+                            {/* Deep Research sub-options: Sites + Persona (only visible when Deep Research OR Lit Survey is ON) */}
+                            {(deepResearch || literatureSurvey) && (
+                                <>
+                                    {/* Sites Selector */}
+                                    <SitesSelector
+                                        sites={sites}
+                                        setSites={(newSites) => { setSites(newSites); saveSites(newSites); }}
+                                        isSiteRestrictionEnabled={isSiteRestrictionEnabled}
+                                        setIsSiteRestrictionEnabled={setIsSiteRestrictionEnabled}
+                                    />
 
-                             {/* Persona Toggle (Simplified) */}
-                            <div className="flex items-center gap-1.5 pl-2 border-l border-white/10 ml-2">
-                                {(['student', 'professor', 'researcher'] as const).map((p) => {
-                                    const Icon = p === 'student' ? User : p === 'professor' ? GraduationCap : Microscope;
-                                    const active = persona === p;
-                                    return (
-                                        <button
-                                            key={p}
-                                            onClick={() => setPersona(active ? 'default' : p)}
-                                            className={cn(
-                                                "flex h-7 w-7 items-center justify-center rounded-full transition-all border",
-                                                active 
-                                                    ? "bg-white text-black border-white"
-                                                    : "bg-transparent text-neutral-600 border-transparent hover:bg-white/10 hover:text-neutral-300"
-                                            )}
-                                            title={`Persona: ${p.charAt(0).toUpperCase() + p.slice(1)}`}
-                                        >
-                                           <Icon size={14} />
-                                        </button>
-                                    );
-                                })}
-                            </div>
+                                    {/* Persona Dropdown (Only for Deep Research) */}
+                                    {deepResearch && (
+                                        <PersonaDropdown persona={persona} setPersona={setPersona} customPersonas={customPersonas} onAddPersona={addCustomPersona} onDeletePersona={deleteCustomPersona} />
+                                    )}
+                                </>
+                            )}
+
+
                         </div>
                     </div>
 
@@ -517,9 +512,9 @@ export const ChatArea = () => {
             </footer>
 
             {/* Timeline Modal */}
-            <TimelineView 
-                isOpen={isTimelineOpen} 
-                onClose={() => setIsTimelineOpen(false)} 
+            <TimelineView
+                isOpen={isTimelineOpen}
+                onClose={() => setIsTimelineOpen(false)}
             />
         </div>
     );

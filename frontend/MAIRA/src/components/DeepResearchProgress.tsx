@@ -6,6 +6,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 interface DeepResearchProgressProps {
     status?: string;
     isActive: boolean;
+    progress?: number;
 }
 
 // Reordered to match backend flow: Search -> Analyze -> Draft -> Reason/Verify -> Finalize
@@ -18,7 +19,7 @@ const RESEARCH_PHASES = [
     { label: 'Finalizing', icon: CheckCircle2, color: 'from-teal-400 to-cyan-500', duration: 12 },
 ];
 
-export const DeepResearchProgress = ({ status, isActive }: DeepResearchProgressProps) => {
+export const DeepResearchProgress = ({ status, isActive, progress: explicitProgress }: DeepResearchProgressProps) => {
     const [progress, setProgress] = useState(0);
     const [currentPhaseIndex, setCurrentPhaseIndex] = useState(0);
     const [elapsed, setElapsed] = useState(0);
@@ -34,37 +35,47 @@ export const DeepResearchProgress = ({ status, isActive }: DeepResearchProgressP
             // Phase 1: Search
             if (lower.includes('searching') || lower.includes('search') || lower.includes('web_search') || lower.includes('arxiv')) {
                 setCurrentPhaseIndex(1);
-            } 
+            }
             // Phase 2: Analyze
             else if (lower.includes('analyz') || lower.includes('reading') || lower.includes('paper') || lower.includes('literature')) {
                 setCurrentPhaseIndex(2);
-            } 
+            }
             // Phase 3: Drafting (Was 4)
             else if (lower.includes('draft') || lower.includes('writing') || lower.includes('generat')) {
                 setCurrentPhaseIndex(3);
-            } 
+            }
             // Phase 4: Verification / Deep Reasoning (Was 3)
             // Includes typical verification tool keywords
             else if (
-                lower.includes('reason') || 
-                lower.includes('thinking') || 
-                lower.includes('deep') || 
-                lower.includes('validat') || 
-                lower.includes('check') || 
-                lower.includes('assess') || 
+                lower.includes('reason') ||
+                lower.includes('thinking') ||
+                lower.includes('deep') ||
+                lower.includes('validat') ||
+                lower.includes('check') ||
+                lower.includes('assess') ||
                 lower.includes('refin')
             ) {
                 setCurrentPhaseIndex(4);
-            } 
+            }
             // Phase 5: Finalizing (Report generation and final checks)
             // Includes "report" as that usually means report-subagent
             else if (lower.includes('final') || lower.includes('complet') || lower.includes('report') || lower.includes('done')) {
                 setCurrentPhaseIndex(5);
             }
         }
-    }, [status, isActive]);
 
-    // Smooth progress animation
+        // Also update phase based on progress if status didn't catch it
+        if (typeof explicitProgress === 'number' && explicitProgress > 0) {
+            if (explicitProgress >= 90) setCurrentPhaseIndex(5); // Finalizing
+            else if (explicitProgress >= 75) setCurrentPhaseIndex(4); // Verification
+            else if (explicitProgress >= 60) setCurrentPhaseIndex(3); // Drafting
+            else if (explicitProgress >= 40) setCurrentPhaseIndex(2); // Analysis (Papers)
+            else if (explicitProgress >= 15) setCurrentPhaseIndex(1); // Searching
+            else setCurrentPhaseIndex(0); // Starting
+        }
+    }, [status, isActive, explicitProgress]);
+
+    // Handle progress updates (either explicit or simulated)
     useEffect(() => {
         if (!isActive) {
             setProgress(0);
@@ -73,18 +84,25 @@ export const DeepResearchProgress = ({ status, isActive }: DeepResearchProgressP
             return;
         }
 
+        // If backend provides explicit progress, use it directly (no simulation)
+        if (typeof explicitProgress === 'number' && explicitProgress > 0) {
+            setProgress(explicitProgress);
+            return;
+        }
+
+        // Fallback: Simulated progress for smooth UX when no explicit updates
         const totalEstimated = RESEARCH_PHASES.reduce((sum, p) => sum + p.duration, 0); // ~100s total
-        
+
         const tick = () => {
             const now = Date.now();
             const elapsedSec = (now - startTimeRef.current) / 1000;
             setElapsed(elapsedSec);
-            
+
             // Asymptotic progress: fast at first, slows down near 95%
             // Never reaches 100% until actually done
             const rawProgress = 1 - Math.exp(-elapsedSec / (totalEstimated * 0.6));
             const cappedProgress = Math.min(rawProgress * 95, 95); // Cap at 95%
-            
+
             setProgress(cappedProgress);
             animFrameRef.current = requestAnimationFrame(tick);
         };
@@ -93,7 +111,7 @@ export const DeepResearchProgress = ({ status, isActive }: DeepResearchProgressP
         return () => {
             if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
         };
-    }, [isActive]);
+    }, [isActive, explicitProgress]);
 
     if (!isActive) return null;
 
@@ -155,7 +173,7 @@ export const DeepResearchProgress = ({ status, isActive }: DeepResearchProgressP
                                     {Math.round(progress)}%
                                 </span>
                                 <p className="text-[10px] text-neutral-600 font-medium">
-                                    ~{formatTime(estimatedRemaining)} remaining
+                                    {typeof explicitProgress === 'number' ? '' : `~${formatTime(estimatedRemaining)} remaining`}
                                 </p>
                             </div>
                         </div>
@@ -167,7 +185,7 @@ export const DeepResearchProgress = ({ status, isActive }: DeepResearchProgressP
                                 <div className="absolute inset-0 rounded-full overflow-hidden">
                                     <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/5 to-transparent animate-shimmer" />
                                 </div>
-                                
+
                                 {/* Progress fill */}
                                 <motion.div
                                     className={cn(

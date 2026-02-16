@@ -29,54 +29,12 @@ AVAILABLE_MODELS = {
         "category": "Fast and cost-efficient",
         "icon": "gemini"
     },
-    "gemini-2.5-flash-lite": {
-        "name": "Gemini 2.5 Flash Lite",
-        "provider": "google",
-        "model_id": "models/gemini-2.5-flash-lite",
-        "category": "Fast and cost-efficient",
-        "icon": "gemini"
-    },
-    "gemini-2.5-pro": {
-        "name": "Gemini 2.5 Pro",
-        "provider": "google",
-        "model_id": "models/gemini-2.5-pro",
-        "category": "Most powerful at complex tasks",
-        "icon": "gemini"
-    },
-    "gemini-2.0-flash": {
-        "name": "Gemini 2.0 Flash",
-        "provider": "google",
-        "model_id": "models/gemini-2.0-flash",
-        "category": "Fast and cost-efficient",
-        "icon": "gemini"
-    },
     "gpt-oss-120b": {
         "name": "GPT OSS 120B",
         "provider": "groq",
         "model_id": "openai/gpt-oss-120b",
         "category": "Versatile and highly intelligent",
         "icon": "openai"
-    },
-    "llama-3.3-70b-versatile": {
-        "name": "LLaMA 3.3 70B Versatile",
-        "provider": "groq",
-        "model_id": "llama-3.3-70b-versatile",
-        "category": "Versatile and highly intelligent",
-        "icon": "meta"
-    },
-    "llama-3.1-8b-instant":{
-        "name": "LLaMA 3.1 8B Instant",
-        "provider": "groq",
-        "model_id": "llama-3.1-8b-instant",
-        "category": "Fast and cost-efficient",
-        "icon": "meta"
-    },
-    "kimi-k2-instruct-0905": {
-        "name": "Kimi K2 Instruct",
-        "provider": "groq",
-        "model_id": "moonshotai/kimi-k2-instruct-0905",
-        "category": "Most powerful at complex tasks",
-        "icon": "moonshotai"
     },
     "claude-opus-4.5": {
         "name": "Claude Opus 4.5",
@@ -85,25 +43,11 @@ AVAILABLE_MODELS = {
         "category": "Most powerful at complex tasks",
         "icon": "anthropic"
     },
-    "claude-sonnet-4.5": {
-        "name": "Claude Sonnet 4.5",
+    "claude-opus-4.6": {
+        "name": "Claude Opus 4.6",
         "provider": "anthropic",
-        "model_id": "claude-sonnet-4-5-20250929",
-        "category": "Versatile and highly intelligent",
-        "icon": "anthropic"
-    },
-    "claude-3-5-sonnet-aws": {
-        "name": "Claude 3.5 Sonnet AWS",
-        "provider": "aws",
-        "model_id": "anthropic.claude-3-5-sonnet-20240620-v1:0",
-        "category": "Fast and cost-efficient",
-        "icon": "anthropic"
-    },
-    "anthropic.claude-sonnet-4-5-20250929-v1:0": {
-        "name": "Claude Sonnet 4.5 AWS",
-        "provider": "aws",
-        "model_id": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
-        "category": "Versatile and highly intelligent",
+        "model_id": "claude-opus-4-6-20251101", # Hypothetical ID
+        "category": "Most powerful at complex tasks",
         "icon": "anthropic"
     },
     "anthropic.claude-opus-4-6-v1": {
@@ -112,11 +56,18 @@ AVAILABLE_MODELS = {
         "model_id": "global.anthropic.claude-opus-4-6-v1",
         "category": "Most powerful at complex tasks",
         "icon": "anthropic"
+    },
+    "anthropic.claude-opus-4-5-v1": {
+        "name": "Claude Opus 4.5 AWS",
+        "provider": "aws",
+        "model_id": "global.anthropic.claude-opus-4-5-v1", # Hypothetical ID
+        "category": "Most powerful at complex tasks",
+        "icon": "anthropic"
     }
 }
 
 # Default model key
-DEFAULT_MODEL = "anthropic.claude-opus-4-6-v1"
+DEFAULT_MODEL = "gemini-3-pro-preview"
 _current_model_key = DEFAULT_MODEL
 
 
@@ -139,7 +90,9 @@ kimi_k2 = ChatGroq(model="moonshotai/kimi-k2-instruct-0905", temperature=0)
 
 # Anthropic Direct Models
 claude_opus_4_5 = ChatAnthropic(model="claude-opus-4-5-20251101", temperature=0.2)
+claude_opus_4_6 = ChatAnthropic(model="claude-opus-4-6-20251101", temperature=0.2) # New
 claude_sonnet_4_5 = ChatAnthropic(model="claude-sonnet-4-5-20250929", temperature=0.2)
+
 from botocore.config import Config # Add this import
 
 # Define a robust config for long-running research tasks
@@ -176,6 +129,23 @@ claude_opus_4_6_aws = ChatBedrockConverse(
     config=bedrock_research_config  # Use the robust config for research tasks
 )
 
+claude_opus_4_5_aws = ChatBedrockConverse(
+    model_id="global.anthropic.claude-opus-4-5-v1",
+    region_name="us-east-1",
+    aws_access_key_id=aws_access_key_id,
+    aws_secret_access_key=aws_secret_access_key,
+    temperature=0.2,
+    config=bedrock_research_config 
+)
+
+
+# =====================================================
+# MODEL SELECTION STATE
+# =====================================================
+
+main_agent_model = gemini_3_pro
+subagent_model = gemini_3_flash
+
 
 # =====================================================
 # HELPER FUNCTIONS (for frontend model selector)
@@ -183,11 +153,20 @@ claude_opus_4_6_aws = ChatBedrockConverse(
 
 def get_model_instance(model_key: str = None):
     """Create and return a model instance based on the model key"""
+    # Simply use the pre-defined instances based on key mapping
+    # This prevents creating new instances repeatedly
     key = model_key or _current_model_key
-    if key not in AVAILABLE_MODELS:
-        key = DEFAULT_MODEL
     
-    config = AVAILABLE_MODELS[key]
+    if key == "gemini-3-pro-preview": return gemini_3_pro
+    if key == "gemini-3-flash-preview": return gemini_3_flash
+    if key == "gpt-oss-120b": return gpt_oss_120b
+    if key == "claude-opus-4.5": return claude_opus_4_5
+    if key == "claude-opus-4.6": return claude_opus_4_6
+    if key == "anthropic.claude-opus-4-6-v1": return claude_opus_4_6_aws
+    if key == "anthropic.claude-opus-4-5-v1": return claude_opus_4_5_aws
+    
+    # Fallback to creating new if needed (legacy behavior)
+    config = AVAILABLE_MODELS.get(key, AVAILABLE_MODELS.get(DEFAULT_MODEL))
     provider = config["provider"]
     model_id = config["model_id"]
     
@@ -205,17 +184,44 @@ def get_model_instance(model_key: str = None):
             aws_secret_access_key=aws_secret_access_key,
             temperature=0.2,
         )
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
+    return gemini_3_pro
 
 
 def set_current_model(model_key: str):
-    """Set the current active model"""
-    global _current_model_key
+    """Set the current active model and update subagent logic"""
+    global _current_model_key, main_agent_model, subagent_model
+    
     if model_key in AVAILABLE_MODELS:
         _current_model_key = model_key
+        
+        # Update Main Agent
+        main_agent_model = get_model_instance(model_key)
+        
+        # Update Subagent Logic based on Main Agent
+        # 1) If Gemini 3 Pro -> Subagent: Gemini 3 Flash
+        if model_key == "gemini-3-pro-preview":
+            subagent_model = gemini_3_flash
+            
+        # 2) If Opus 4.6 AWS or Opus 4.5 AWS -> Subagent: 4.5 Sonnet AWS
+        elif model_key in ["anthropic.claude-opus-4-6-v1", "anthropic.claude-opus-4-5-v1"]:
+            subagent_model = claude_sonnet_4_5_aws
+            
+        # 3) If Opus 4.6 or Opus 4.5 -> Subagent: 4.5 Sonnet
+        elif model_key in ["claude-opus-4.6", "claude-opus-4.5"]:
+            subagent_model = claude_sonnet_4_5
+            
+        # 4) If GPT OSS 120B -> Subagent: LLaMA 3.3 70B
+        elif model_key == "gpt-oss-120b":
+            subagent_model = llama_70b
+            
+        # Default fallback
+        else:
+            subagent_model = gemini_3_flash
+            
+        print(f"Model Switched: Main={model_key}, Subagent={type(subagent_model).__name__}")
         return True
     return False
+
 
 
 def get_current_model_key():
@@ -229,16 +235,6 @@ def get_current_model_info():
         "key": _current_model_key,
         **AVAILABLE_MODELS.get(_current_model_key, AVAILABLE_MODELS[DEFAULT_MODEL])
     }
-
-
-# =====================================================
-# DEFAULT EXPORTS
-# =====================================================
-# Main agent model (default: Claude Opus 4.6 AWS)
-main_agent_model = claude_opus_4_6_aws
-
-# Subagent model (default: Gemini 2.5 Pro)
-subagent_model = gemini_3_pro
 
 
 print("✅ Config loaded - Models ready for import")

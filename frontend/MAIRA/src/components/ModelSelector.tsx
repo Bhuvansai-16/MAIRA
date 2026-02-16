@@ -1,5 +1,6 @@
-import { useState, useEffect, useRef } from 'react';
-import { ChevronDown, Check, Sparkles, Zap, Brain } from 'lucide-react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { createPortal } from 'react-dom';
+import { ChevronDown, Check } from 'lucide-react';
 import { cn } from '../lib/utils';
 
 const API_BASE = 'http://localhost:8000';
@@ -22,38 +23,6 @@ interface ModelsResponse {
     };
 }
 
-// Provider icon components
-const ProviderIcon = ({ provider, className }: { provider: string; className?: string }) => {
-    switch (provider) {
-        case 'gemini':
-        case 'google':
-            return (
-                <div className={cn("flex items-center justify-center rounded-lg bg-blue-500/20", className)}>
-                    <Sparkles size={14} className="text-blue-400" />
-                </div>
-            );
-        case 'anthropic':
-            return (
-                <div className={cn("flex items-center justify-center rounded-lg bg-orange-500/20", className)}>
-                    <span className="text-orange-400 font-bold text-xs">A</span>
-                </div>
-            );
-        case 'openai':
-        case 'groq':
-            return (
-                <div className={cn("flex items-center justify-center rounded-lg bg-green-500/20", className)}>
-                    <Brain size={14} className="text-green-400" />
-                </div>
-            );
-        default:
-            return (
-                <div className={cn("flex items-center justify-center rounded-lg bg-neutral-500/20", className)}>
-                    <Zap size={14} className="text-neutral-400" />
-                </div>
-            );
-    }
-};
-
 // Category order for display
 const CATEGORY_ORDER = [
     'Fast and cost-efficient',
@@ -61,36 +30,60 @@ const CATEGORY_ORDER = [
     'Most powerful at complex tasks'
 ];
 
-const CATEGORY_ICONS: Record<string, React.ReactNode> = {
-    'Fast and cost-efficient': <Zap size={12} className="text-yellow-400" />,
-    'Versatile and highly intelligent': <Sparkles size={12} className="text-blue-400" />,
-    'Most powerful at complex tasks': <Brain size={12} className="text-purple-400" />
-};
-
 export const ModelSelector = () => {
     const [isOpen, setIsOpen] = useState(false);
     const [models, setModels] = useState<Record<string, Model[]>>({});
     const [currentModel, setCurrentModel] = useState<ModelsResponse['current'] | null>(null);
     const [isLoading, setIsLoading] = useState(false);
     const [isChanging, setIsChanging] = useState(false);
+    const triggerRef = useRef<HTMLButtonElement>(null);
     const dropdownRef = useRef<HTMLDivElement>(null);
+    const [dropdownPos, setDropdownPos] = useState({ bottom: 0, left: 0 });
 
     // Fetch available models on mount
     useEffect(() => {
         fetchModels();
     }, []);
 
+    // Calculate position
+    const updatePos = useCallback(() => {
+        if (triggerRef.current) {
+            const rect = triggerRef.current.getBoundingClientRect();
+            setDropdownPos({
+                bottom: window.innerHeight - rect.top + 8, // 8px gap above button
+                left: rect.left
+            });
+        }
+    }, []);
+
+    // Recalculate on open & events
+    useEffect(() => {
+        if (!isOpen) return;
+        updatePos();
+        window.addEventListener("scroll", updatePos, true);
+        window.addEventListener("resize", updatePos);
+        return () => {
+            window.removeEventListener("scroll", updatePos, true);
+            window.removeEventListener("resize", updatePos);
+        };
+    }, [isOpen, updatePos]);
+
     // Close dropdown when clicking outside
     useEffect(() => {
+        if (!isOpen) return;
         const handleClickOutside = (event: MouseEvent) => {
-            if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+            const target = event.target as Node;
+            if (
+                triggerRef.current && !triggerRef.current.contains(target) &&
+                dropdownRef.current && !dropdownRef.current.contains(target)
+            ) {
                 setIsOpen(false);
             }
         };
 
         document.addEventListener('mousedown', handleClickOutside);
         return () => document.removeEventListener('mousedown', handleClickOutside);
-    }, []);
+    }, [isOpen]);
 
     const fetchModels = async () => {
         setIsLoading(true);
@@ -136,91 +129,67 @@ export const ModelSelector = () => {
         }
     };
 
-    // Sort categories by predefined order
-    const sortedCategories = CATEGORY_ORDER.filter(cat => models[cat]);
+    // Sort and flatten models for display
+    const flatModels = CATEGORY_ORDER.flatMap(cat => models[cat] || []);
+
+    const dropdown = isOpen && createPortal(
+        <div
+            ref={dropdownRef}
+            className="fixed z-[200] w-[200px] rounded-xl bg-[#0a0a0a] border border-white/10 shadow-2xl shadow-black/80 overflow-hidden animate-slide-up"
+            style={{
+                bottom: dropdownPos.bottom,
+                left: dropdownPos.left,
+            }}
+        >
+            <div className="p-1.5 flex flex-col gap-0.5 max-h-[300px] overflow-y-auto scrollbar-hide">
+                {flatModels.map((model) => {
+                    const isSelected = model.key === currentModel?.key;
+
+                    return (
+                        <button
+                            key={model.key}
+                            onClick={() => selectModel(model.key)}
+                            className={cn(
+                                "w-full flex items-center justify-between px-3 py-2 rounded-lg text-sm text-left transition-all",
+                                isSelected
+                                    ? "bg-indigo-500 text-white font-medium"
+                                    : "text-neutral-300 hover:bg-white/5 hover:text-white"
+                            )}
+                        >
+                            <span>{model.name}</span>
+                            {isSelected && <Check size={14} className="text-white" />}
+                        </button>
+                    );
+                })}
+            </div>
+        </div>,
+        document.body
+    );
 
     return (
-        <div className="relative" ref={dropdownRef}>
+        <>
             {/* Trigger Button */}
             <button
+                ref={triggerRef}
                 onClick={() => setIsOpen(!isOpen)}
                 disabled={isLoading || isChanging}
                 className={cn(
-                    "flex items-center gap-2 px-3 py-1.5 rounded-full border transition-all",
-                    "bg-white/5 border-white/10 hover:bg-white/10 hover:border-white/20",
-                    isOpen && "bg-white/10 border-white/20",
+                    "flex items-center gap-1.5 text-sm font-medium text-neutral-300 transition-colors hover:text-white",
                     (isLoading || isChanging) && "opacity-50 cursor-wait"
                 )}
             >
-                {currentModel && (
-                    <ProviderIcon provider={currentModel.icon} className="h-5 w-5" />
-                )}
-                <span className="text-[10px] font-bold text-neutral-300 uppercase tracking-wider max-w-[100px] truncate">
+                <span>
                     {isChanging ? 'Switching...' : (currentModel?.name || 'Select Model')}
                 </span>
-                <ChevronDown 
-                    size={12} 
+                <ChevronDown
+                    size={14}
                     className={cn(
-                        "text-neutral-500 transition-transform",
+                        "text-neutral-500 transition-transform duration-200",
                         isOpen && "rotate-180"
-                    )} 
+                    )}
                 />
             </button>
-
-            {/* Dropdown Panel */}
-            {isOpen && (
-                <div className="absolute right-0 top-full mt-2 w-72 rounded-2xl bg-[#1a1a1a] border border-white/10 shadow-2xl shadow-black/50 overflow-hidden z-50 animate-fade-in">
-                    {/* Header */}
-                    <div className="px-4 py-3 border-b border-white/5">
-                        <h3 className="text-sm font-bold text-white">Models</h3>
-                    </div>
-
-                    {/* Model List */}
-                    <div className="max-h-[400px] overflow-y-auto">
-                        {sortedCategories.map((category) => (
-                            <div key={category}>
-                                {/* Category Header */}
-                                <div className="px-4 py-2 bg-white/5 flex items-center gap-2">
-                                    {CATEGORY_ICONS[category]}
-                                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-wider">
-                                        {category}
-                                    </span>
-                                </div>
-
-                                {/* Models in Category */}
-                                {models[category]?.map((model) => {
-                                    const isSelected = model.key === currentModel?.key;
-                                    
-                                    return (
-                                        <button
-                                            key={model.key}
-                                            onClick={() => selectModel(model.key)}
-                                            className={cn(
-                                                "w-full flex items-center gap-3 px-4 py-3 transition-all",
-                                                "hover:bg-white/5",
-                                                isSelected && "bg-blue-500/10"
-                                            )}
-                                        >
-                                            <ProviderIcon provider={model.icon} className="h-8 w-8" />
-                                            <div className="flex-1 text-left">
-                                                <div className={cn(
-                                                    "text-sm font-semibold",
-                                                    isSelected ? "text-blue-400" : "text-white"
-                                                )}>
-                                                    {model.name}
-                                                </div>
-                                            </div>
-                                            {isSelected && (
-                                                <Check size={16} className="text-blue-400" />
-                                            )}
-                                        </button>
-                                    );
-                                })}
-                            </div>
-                        ))}
-                    </div>
-                </div>
-            )}
-        </div>
+            {dropdown}
+        </>
     );
 };

@@ -413,8 +413,61 @@ CREATE TRIGGER trigger_store_updated_at
 -- VALUES ('test@example.com', 'testuser', 'Test User');
 
 -- =====================================================
+-- CUSTOM PERSONAS TABLE
+-- User-defined personas with custom instructions
+-- =====================================================
+CREATE TABLE IF NOT EXISTS custom_personas (
+    persona_id UUID PRIMARY KEY DEFAULT generate_uuid_v7(),
+    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+
+    -- Persona info
+    name VARCHAR(100) NOT NULL,
+    instructions TEXT NOT NULL,
+
+    -- Status
+    is_active BOOLEAN DEFAULT TRUE,
+
+    -- Timestamps
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Indexes for custom_personas
+CREATE INDEX IF NOT EXISTS idx_custom_personas_user ON custom_personas(user_id);
+CREATE INDEX IF NOT EXISTS idx_custom_personas_user_active ON custom_personas(user_id) WHERE is_active = TRUE;
+
+-- Trigger to auto-update updated_at
+CREATE TRIGGER trigger_custom_personas_updated_at
+    BEFORE UPDATE ON custom_personas
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+
+-- =====================================================
+-- USER SITES TABLE
+-- Stores user-specific search sites that persist across sessions
+-- =====================================================
+CREATE TABLE IF NOT EXISTS user_sites (
+    site_id UUID PRIMARY KEY DEFAULT generate_uuid_v7(),
+    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+
+    -- Site URL (cleaned, e.g. "github.com")
+    url VARCHAR(500) NOT NULL,
+
+    -- Timestamps
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+
+    -- Prevent duplicate sites per user
+    UNIQUE(user_id, url)
+);
+
+-- Indexes for user_sites
+CREATE INDEX IF NOT EXISTS idx_user_sites_user ON user_sites(user_id);
+
+
+-- =====================================================
 -- GRANTS (Adjust based on your database user)
 -- =====================================================
 -- GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO maira_user;
 -- GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO maira_user;
 -- GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO maira_user;
+

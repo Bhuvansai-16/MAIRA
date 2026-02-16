@@ -2,6 +2,8 @@ from langchain.agents import create_agent
 from tools.searchtool import internet_search
 from tools.extracttool import extract_webpage
 from config import subagent_model
+from langchain.agents.middleware import ModelFallbackMiddleware, ModelRetryMiddleware
+from config import gemini_2_5_pro, claude_3_5_sonnet_aws
 websearch_subagent = {
     "name": "websearch-agent",
     "description": "Conducts deep web research and extracts webpage content, returning condensed summaries (not raw dumps) with relevant images.",
@@ -61,5 +63,13 @@ OUTPUT FORMAT (STRICT - MAX 800 WORDS TOTAL):
 - Keep context clean for downstream agents
 """,
     "tools": [internet_search, extract_webpage],
-    "model": subagent_model
+    "model": subagent_model,
+    "middleware": [
+        # Fallback specifically for this subagent
+        ModelFallbackMiddleware(
+            gemini_2_5_pro, # First fallback
+            claude_3_5_sonnet_aws       # Second fallback
+        ),
+        ModelRetryMiddleware(max_retries=2)
+    ]
 }

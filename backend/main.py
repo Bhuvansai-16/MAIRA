@@ -27,8 +27,19 @@ from database import (
     ingest_text,
     ingest_image_description,
     delete_user_documents,
+    # Custom personas
+    create_custom_persona,
+    get_custom_personas,
+    update_custom_persona,
+    delete_custom_persona,
+    # User sites
+    get_user_sites,
+    set_user_sites,
+    add_user_site,
+    remove_user_site,
 )
 from config import AVAILABLE_MODELS, get_current_model_info, set_current_model, get_model_instance
+import config
 from thread_manager import thread_manager, Thread, CheckpointInfo
 from datetime import datetime
 import json
@@ -37,6 +48,7 @@ from collections import defaultdict
 import threading
 import queue
 import time
+import download_store
 
 # Active session tracking for reconnection support
 # Stores: thread_id -> {"status": "running"|"completed"|"error", "events": [], "last_content": str, "prompt": str}
@@ -137,6 +149,7 @@ class AgentRequest(BaseModel):
     deep_research: bool = False  # When True, enables full Tier 3 research workflow
     literature_survey: bool = False  # When True, enables literature survey mode
     persona: str = "default"
+    sites: Optional[list[str]] = None  # When provided, restrict web searches to these domains
     parent_checkpoint_id: Optional[str] = None  # For branching from a specific checkpoint
     last_event_id: Optional[str] = None  # For stream reconnection
     # Edit/versioning support
@@ -166,6 +179,23 @@ class EditMessageRequest(BaseModel):
 
 class SessionStatusRequest(BaseModel):
     thread_id: str
+
+class CreatePersonaRequest(BaseModel):
+    user_id: str
+    name: str
+    instructions: str
+
+class UpdatePersonaRequest(BaseModel):
+    name: Optional[str] = None
+    instructions: Optional[str] = None
+
+class SetSitesRequest(BaseModel):
+    user_id: str
+    urls: list[str]
+
+class AddSiteRequest(BaseModel):
+    user_id: str
+    url: str
 
 
 class ModelSelectRequest(BaseModel):
@@ -518,26 +548,148 @@ def select_model(request: ModelSelectRequest, http_request: Request):
     # Update the current model
     set_current_model(request.model_key)
     
-    # Recreate the agent with the new model
+    # Recreate the main agent with the new model
     try:
         new_model = get_model_instance(request.model_key)
         
-        # Recreate main agent with new model (subagents stay on their fixed model)
+        # KEY FIX: Update SUBAGENTS to use the new subagent_model from config
+        # This ensures subagents switch model according to the logic in config.py
+        current_subagent_model = config.subagent_model
+        
+        # Iterate through the subagents list (imported from main_agent) and update their model
+        for subagent_config in subagents:
+            if isinstance(subagent_config, dict) and "model" in subagent_config:
+                subagent_config["model"] = current_subagent_model
+                
+        # Recreate main agent with new model and UPDATED subagents
         http_request.app.state.agent = create_deep_agent(
-            subagents=subagents,
+            subagents=subagents,  # Now contains updated models
             model=new_model,
             tools=tools,
             system_prompt=research_prompt,
             checkpointer=checkpointer,
         )
         
+        subagent_name = type(current_subagent_model).__name__
         return {
             "status": "success",
-            "message": f"Main agent model changed to {AVAILABLE_MODELS[request.model_key]['name']} (subagents remain on Gemini 2.5 Flash Lite)",
+            "message": f"Main agent switched to {AVAILABLE_MODELS[request.model_key]['name']}. Subagents switched to {subagent_name}.",
             "current": get_current_model_info()
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to switch model: {str(e)}")
+
+
+# -----------------------------
+# Custom Personas Endpoints
+# -----------------------------
+
+@app.get("/personas")
+def list_personas(user_id: str):
+    """Get all custom personas for a user."""
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    try:
+        personas = get_custom_personas(user_id)
+        return personas
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch personas: {str(e)}")
+
+
+@app.post("/personas")
+def create_persona(request: CreatePersonaRequest):
+    """Create a new custom persona."""
+    if not request.name or not request.name.strip():
+        raise HTTPException(status_code=400, detail="Persona name is required")
+    if not request.instructions or not request.instructions.strip():
+        raise HTTPException(status_code=400, detail="Persona instructions are required")
+    
+    result = create_custom_persona(
+        user_id=request.user_id,
+        name=request.name.strip(),
+        instructions=request.instructions.strip()
+    )
+    if result:
+        return result
+    raise HTTPException(status_code=500, detail="Failed to create persona")
+
+
+@app.put("/personas/{persona_id}")
+def update_persona(persona_id: str, request: UpdatePersonaRequest, user_id: str = None):
+    """Update a custom persona."""
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id query param is required")
+    
+    success = update_custom_persona(
+        persona_id=persona_id,
+        user_id=user_id,
+        name=request.name.strip() if request.name else None,
+        instructions=request.instructions.strip() if request.instructions else None
+    )
+    if success:
+        return {"status": "updated"}
+    raise HTTPException(status_code=404, detail="Persona not found or not owned by user")
+
+
+@app.delete("/personas/{persona_id}")
+def delete_persona(persona_id: str, user_id: str = None):
+    """Delete a custom persona."""
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id query param is required")
+    
+    success = delete_custom_persona(persona_id=persona_id, user_id=user_id)
+    if success:
+        return {"status": "deleted"}
+    raise HTTPException(status_code=404, detail="Persona not found or not owned by user")
+
+
+# -----------------------------
+# User Sites Endpoints
+# -----------------------------
+
+@app.get("/user-sites")
+def list_user_sites(user_id: str):
+    """Get all saved sites for a user."""
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    try:
+        sites = get_user_sites(user_id)
+        return {"sites": sites}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch sites: {str(e)}")
+
+
+@app.put("/user-sites")
+def save_user_sites(request: SetSitesRequest):
+    """Replace all saved sites for a user."""
+    success = set_user_sites(user_id=request.user_id, urls=request.urls)
+    if success:
+        return {"status": "saved", "count": len(request.urls)}
+    raise HTTPException(status_code=500, detail="Failed to save sites")
+
+
+@app.post("/user-sites")
+def add_site(request: AddSiteRequest):
+    """Add a single site for a user."""
+    if not request.url or not request.url.strip():
+        raise HTTPException(status_code=400, detail="URL is required")
+    
+    success = add_user_site(user_id=request.user_id, url=request.url.strip())
+    if success:
+        return {"status": "added"}
+    return {"status": "already_exists"}  # ON CONFLICT DO NOTHING
+
+
+@app.delete("/user-sites")
+def remove_site(user_id: str, url: str):
+    """Remove a single site for a user."""
+    if not user_id or not url:
+        raise HTTPException(status_code=400, detail="user_id and url are required")
+    
+    success = remove_user_site(user_id=user_id, url=url)
+    if success:
+        return {"status": "removed"}
+    raise HTTPException(status_code=404, detail="Site not found")
 
 
 @app.get("/db-status")
@@ -908,6 +1060,16 @@ def get_thread_messages(thread_id: str, request: Request):
         return {"thread_id": thread_id, "messages": [], "error": str(e)}
 
 
+@app.get("/threads/{thread_id}/downloads")
+def get_thread_downloads(thread_id: str):
+    """Retrieve persisted downloads from Supabase Storage for history reload."""
+    try:
+        downloads = download_store.get_downloads_from_supabase(thread_id)
+        return {"thread_id": thread_id, "downloads": downloads}
+    except Exception as e:
+        print(f"⚠️ Failed to fetch downloads for {thread_id}: {e}")
+        return {"thread_id": thread_id, "downloads": []}
+
 # -----------------------------
 # History & Branching Endpoints
 # -----------------------------
@@ -1168,7 +1330,7 @@ def reconnect_session_stream(thread_id: str, from_index: int = 0):
 # -----------------------------
 
 # Maximum retries for transient DB/SSL errors during streaming
-_MAX_STREAM_RETRIES = 1
+_MAX_STREAM_RETRIES = 3
 
 
 def _stream_with_retry(agent, stream_input, config, thread_id, store_event):
@@ -1195,8 +1357,26 @@ def _stream_with_retry(agent, stream_input, config, thread_id, store_event):
             if _is_transient_error(error_msg) and attempt < _MAX_STREAM_RETRIES:
                 attempt += 1
                 print(f"🔄 Stream retry {attempt}/{_MAX_STREAM_RETRIES} for thread {thread_id}: {error_msg}")
-                # Do NOT call reset_pool() here — the checkpointer has its own
-                # dedicated pool with health checks that will auto-recover.
+                
+                # Fully reset the checkpointer pool — the SSL connection is dead.
+                # A simple health check is not enough; the dead connection may be
+                # the one LangGraph's PostgresSaver uses internally.
+                try:
+                    from database import reset_checkpointer_pool, _checkpointer_pool, get_checkpointer
+                    reset_checkpointer_pool()
+                    
+                    # Reinitialize the checkpointer with the fresh pool
+                    new_checkpointer = get_checkpointer()
+                    
+                    # Update the agent's checkpointer so retries use the fresh pool
+                    # LangGraph compiled graphs store checkpointer internally
+                    if hasattr(agent, 'checkpointer'):
+                        agent.checkpointer = new_checkpointer
+                    
+                    print(f"   ✅ Checkpointer fully reset and reinitialized")
+                except Exception as pool_err:
+                    print(f"   ⚠️ Checkpointer pool reset failed: {pool_err}")
+                
                 time.sleep(min(3 * attempt, 10))
 
                 # Notify frontend
@@ -1212,7 +1392,7 @@ def _stream_with_retry(agent, stream_input, config, thread_id, store_event):
             raise  # Non-transient or retries exhausted — propagate to caller
 
 
-def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_research: bool, literature_survey: bool = False, persona: str = "default", edit_metadata: Optional[dict] = None):
+def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_research: bool, literature_survey: bool = False, persona: str = "default", edit_metadata: Optional[dict] = None, sites: Optional[list[str]] = None, user_id: Optional[str] = None):
     """
     DETACHED BACKGROUND THREAD: Runs the agent independently of HTTP connection.
     This thread continues even if the browser reloads or disconnects.
@@ -1223,8 +1403,11 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
         prompt: User's message
         config: Agent configuration
         deep_research: Whether deep research mode is enabled
-        persona: The persona to adopt (Student, Professor, Researcher)
+        literature_survey: Whether literature survey mode is enabled
+        persona: The persona to adopt (Student, Professor, Researcher, or custom-{id})
         edit_metadata: Optional dict with edit_group_id, edit_version, original_message_index
+        sites: Optional list of domains to restrict search to
+        user_id: Optional user ID for fetching custom personas
     """
     import re
     import hashlib
@@ -1235,12 +1418,13 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
     # Mapping of tool/agent names to user-friendly status messages
     TOOL_STATUS_MESSAGES = {
         # Subagents (called via 'task' tool)
+        'write_todos': {'start': '📅 Planning research...', 'complete': 'Plan created'},
+        'github-agent': {'start': '🐙 Analyzing GitHub repo...', 'complete': 'Repo analysis complete'},
         'websearch-agent': {'start': '🌐 Searching the web...', 'complete': 'Web search complete'},
         'academic-paper-agent': {'start': '📚 Searching for research papers...', 'complete': 'Paper search complete'},
         'draft-subagent': {'start': '✍️ Drafting results...', 'complete': 'Draft complete'},
-        'validation-agent': {'start': '🔗 Validating citations...', 'complete': 'Citation validation complete'},
-        'fact-checking-agent': {'start': '✅ Fact-checking claims...', 'complete': 'Fact-check complete'},
-        'quality-checking-agent': {'start': '📋 Checking content quality...', 'complete': 'Quality check complete'},
+        'deep-reasoning-agent': {'start': '🧠 Deep verification...', 'complete': 'Verification complete'},
+        'summary-subagent': {'start': '📝 Summarizing findings...', 'complete': 'Summary complete'},
         'report-subagent': {'start': '📄 Generating report...', 'complete': 'Report generated'},
         # Direct tools
         'internet_search': {'start': '🔍 Performing web search...', 'complete': 'Search complete'},
@@ -1257,6 +1441,21 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
         'generate_and_convert_document': {'start': '📝 Generating document...', 'complete': 'Document generated'},
         'generate_large_document_with_chunks': {'start': '📚 Generating large document...', 'complete': 'Document generated'},
         'search_knowledge_base': {'start': '🔍 Searching uploaded documents...', 'complete': 'Document search complete'},
+    }
+    
+    # Progress mapping (0-100)
+    TOOL_PROGRESS = {
+        'write_todos': 10,
+        'github-agent': 15,
+        'search_knowledge_base': 15,
+        'websearch-agent': 30,
+        'academic-paper-agent': 40,
+        'draft-subagent': 60,
+        'deep-reasoning-agent': 75,
+        'summary-subagent': 90,
+        'report-subagent': 95,
+        'literature-survey-agent': 50,
+        'internet_search': 25,
     }
     
     def store_event(event_data: dict):
@@ -1318,12 +1517,33 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
         elif persona_value == "professor":
             persona_instruction = "\n[PERSONA: PROFESSOR - Be academic, authoritative, cite sources, encourage critical thinking]"
         elif persona_value == "researcher":
-            persona_instruction = "\n[PERSONA: RESEARCHER - Focus on methodology, data, novel insights, technical precision]"
+            persona_instruction = "\n[PERSONA: RESEARCHER - Be technical, data-driven, focus on methodology and results]"
+        elif persona_value.startswith("custom-") and user_id:
+            # Fetch custom persona from DB
+            try:
+                persona_id = persona_value.replace("custom-", "")
+                custom_personas = get_custom_personas(user_id)
+                found_persona = next((p for p in custom_personas if p["persona_id"] == persona_id), None)
+                if found_persona:
+                    # Clean instructions to remove newlines for compact log
+                    safe_instr = found_persona['instructions'].replace('\n', ' ')
+                    persona_instruction = f"\n[PERSONA: {found_persona['name']} - {safe_instr}]"
+                    print(f"   👤 Applied custom persona: {found_persona['name']}")
+            except Exception as e:
+                print(f"   ⚠️ Failed to load custom persona {persona_value}: {e}")
+                persona_instruction = "\n[PERSONA: DEFAULT - Professional, balanced research assistant style]"
         else:
             # Even for "default", add a tag so agents are aware
             persona_instruction = "\n[PERSONA: DEFAULT - Professional, balanced research assistant style]"
         
+        # Initialize user content
         user_content = f"{mode_prefix}{prompt}{persona_instruction}"
+        
+        # Add site restrictions if provided
+        if sites and len(sites) > 0:
+            site_list = ", ".join(sites)
+            user_content += f"\n[CONSTRAINT: RESTRICT SEARCH TO DOMAINS: {site_list}. When using web search tools, always include 'site:domain' operators to restrict results to these sites.]"
+            print(f"   🌐 Applied site restrictions: {site_list}")
         
         print(f"   💬 Final message preview: {user_content[:150]}...")
         
@@ -1404,12 +1624,15 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
                                 
                                 if display_name and display_name not in active_tools:
                                     active_tools.add(display_name)
+                                    progress_val = TOOL_PROGRESS.get(display_name)
+                                    
                                     status_event = {
                                         "type": "status",
                                         "step": "start",
                                         "agent": node_name,
                                         "tool": display_name,
-                                        "message": get_status_message(display_name, "start")
+                                        "message": get_status_message(display_name, "start"),
+                                        "progress": progress_val
                                     }
                                     store_event(status_event)
                                     print(f"  🔧 [{node_name}] Starting: {display_name}")
@@ -1601,12 +1824,34 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
         
         if not all_downloads and download_marker_seen:
             print(f"  ⚠️ Download marker was seen in stream but no data found in tool storage")
+            # Fallback: try Supabase in case tools uploaded there before SSL crash
+            try:
+                supabase_downloads = download_store.get_downloads_from_supabase(thread_id)
+                for sd in supabase_downloads:
+                    all_downloads.append({
+                        "type": "download",
+                        "filename": sd.get("filename", "download"),
+                        "data": sd.get("data", "")
+                    })
+                if supabase_downloads:
+                    print(f"  ☁️  Recovered {len(supabase_downloads)} download(s) from Supabase fallback")
+            except Exception as sb_err:
+                print(f"  ⚠️ Supabase fallback failed: {sb_err}")
         
-        # Send all download events
+        # Send all download events AND persist to Supabase for history reload
         for download_event in all_downloads:
             time.sleep(0.3)  # Small delay between downloads
             store_event(download_event)
             print(f"  📥 Download event sent: {download_event.get('filename')}")
+            # Persist to Supabase so reloads from history can retrieve the file
+            try:
+                download_store.save_to_supabase(
+                    thread_id,
+                    download_event.get("filename", "download"),
+                    download_event.get("data", "")
+                )
+            except Exception as save_err:
+                print(f"  ⚠️ Supabase persist failed (non-fatal): {save_err}")
         
         # Send completion event with final checkpoint ID
         final_state = agent.get_state(config)
@@ -1656,6 +1901,24 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
         
         if thread_id in active_sessions:
             active_sessions[thread_id]["status"] = "error"
+        
+        # Last-resort: try to salvage any pending downloads to Supabase
+        # so they aren't lost after all retries fail
+        try:
+            from tools.pdftool import get_pending_download as _get_pdf
+            from tools.doctool import get_pending_download as _get_docx
+            from tools.latextoformate import get_pending_download as _get_latex
+            for _get_fn in [_get_pdf, _get_docx, _get_latex]:
+                _pending = _get_fn()
+                if _pending and _pending.get("data"):
+                    download_store.save_to_supabase(
+                        thread_id,
+                        _pending.get("filename", "download"),
+                        _pending["data"]
+                    )
+                    print(f"  ☁️  Salvaged download to Supabase: {_pending.get('filename')}")
+        except Exception as salvage_err:
+            print(f"  ⚠️ Download salvage failed: {salvage_err}")
     finally:
         # Cleanup: Remove thread reference
         if thread_id in background_threads:
@@ -1712,11 +1975,11 @@ def run_agent(request: AgentRequest, http_request: Request):
     # Update thread title based on first user message
     thread = thread_manager.get_thread(thread_id)
     if thread and thread.title in ["New Chat", "Chat"]:
-        # Strip [UPLOADED_FILES: ...] prefix for title generation
+        # Strip all metadata tags for title generation
         import re
-        clean_prompt = re.sub(r'\[UPLOADED_FILES:.*?\]', '', request.prompt, flags=re.DOTALL).strip()
+        clean_prompt = re.sub(r'\[(?:UPLOADED_FILES|MODE|PERSONA|SITES|CONSTRAINT|EDIT_META)[:\s][\s\S]*?\]', '', request.prompt).strip()
         if not clean_prompt:
-            clean_prompt = "Attachment Upload"
+            clean_prompt = "Research Session"
             
         title = clean_prompt[:50] + ("..." if len(clean_prompt) > 50 else "")
         thread_manager.update_thread_title(thread_id, title)
@@ -1742,6 +2005,7 @@ def run_agent(request: AgentRequest, http_request: Request):
         "prompt": request.prompt,
         "deep_research": request.deep_research,
         "literature_survey": request.literature_survey,
+        "sites": request.sites or [],
         "started_at": datetime.now().isoformat()
     }
     
@@ -1760,7 +2024,7 @@ def run_agent(request: AgentRequest, http_request: Request):
     # START DETACHED BACKGROUND THREAD
     bg_thread = threading.Thread(
         target=run_agent_background,
-        args=(agent, thread_id, request.prompt, config, request.deep_research, request.literature_survey, request.persona, edit_metadata),
+        args=(agent, thread_id, request.prompt, config, request.deep_research, request.literature_survey, request.persona, edit_metadata, request.sites, request.user_id),
         daemon=True
     )
     bg_thread.start()
@@ -1837,6 +2101,8 @@ def _serialize_message(msg) -> Optional[Dict[str, Any]]:
             import re
             content = re.sub(r'\[MODE:.*?\]', '', content)
             content = re.sub(r'\[SUBAGENT:.*?\]', '', content)
+            content = re.sub(r'\[SITES:.*?\]', '', content)
+            content = re.sub(r'\[RESTRICT_SEARCH:.*?\]', '', content)
             
             # Strip download markers from AI messages (they're sent via separate 'download' events now)
             # This prevents corrupted/truncated base64 from appearing in the UI
@@ -1877,6 +2143,8 @@ def _serialize_message(msg) -> Optional[Dict[str, Any]]:
                     # Strip internal markers
                     text = re.sub(r'\[MODE:.*?\]', '', text)
                     text = re.sub(r'\[SUBAGENT:.*?\]', '', text)
+                    text = re.sub(r'\[SITES:.*?\]', '', text)
+                    text = re.sub(r'\[RESTRICT_SEARCH:.*?\]', '', text)
                     # Strip download markers from AI messages
                     if msg_type not in ["tool", "function"] and msg_role not in ["tool", "function"]:
                         for marker in ["[DOWNLOAD_PDF]", "[DOWNLOAD_DOCX]", "[DOWNLOAD_MD]"]:
@@ -1977,6 +2245,44 @@ def _serialize_chunk(chunk) -> Optional[Dict[str, Any]]:
     except Exception as e:
         print(f"DEBUG SERIALIZE ERROR: {e}")
         return None
+
+
+# -----------------------------
+# Paper Writer Chat Endpoint
+# -----------------------------
+
+class PaperWriterChatRequest(BaseModel):
+    message: str
+    session_id: str = "default-session"
+    paper_content: Optional[str] = None
+    chat_history: Optional[list] = None
+
+@app.post("/paper-writer/chat")
+def paper_writer_chat(request: PaperWriterChatRequest):
+    """AI assistant for modifying LaTeX paper templates."""
+    try:
+        from paper_writer.writer import process_writer_request
+        
+        result = process_writer_request(
+            message=request.message,
+            paper_content=request.paper_content,
+            chat_history=request.chat_history
+        )
+        
+        return {
+            "response": result["response"],
+            "updated_latex": result.get("updated_latex"),
+            "change_type": result.get("change_type", "info"),
+            "success": result.get("success", True)
+        }
+    except Exception as e:
+        print(f"Paper Writer Error: {e}")
+        return {
+            "response": f"Sorry, I encountered an error: {str(e)}",
+            "updated_latex": None,
+            "change_type": "error",
+            "success": False
+        }
 
 
 # -----------------------------

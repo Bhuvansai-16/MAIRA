@@ -1,5 +1,5 @@
 import { Link } from 'react-router-dom';
-import { Shield, ArrowRight, Sparkles, Globe, FileText, Brain, Zap, CheckCircle, LogOut } from 'lucide-react';
+import { Shield, ArrowRight, Sparkles, Globe, FileText, Brain, Zap, CheckCircle, LogOut, PenLine } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 
 export const Home = () => {
@@ -11,7 +11,7 @@ export const Home = () => {
             <div className="absolute top-0 left-1/2 -translate-x-1/2 w-full max-w-6xl h-[800px] bg-violet-600/10 blur-[200px] pointer-events-none" />
             <div className="absolute bottom-0 right-0 w-[600px] h-[600px] bg-blue-600/5 blur-[150px] pointer-events-none" />
             <div className="absolute top-1/2 left-0 w-[400px] h-[400px] bg-indigo-600/5 blur-[120px] pointer-events-none" />
-            
+
             {/* Navigation */}
             <nav className="relative z-20 flex items-center justify-between px-8 py-6 max-w-7xl mx-auto">
                 <Link to="/" className="flex items-center gap-3 group">
@@ -20,7 +20,7 @@ export const Home = () => {
                     </div>
                     <span className="text-xl font-black text-white tracking-tight">MAIRA</span>
                 </Link>
-                
+
                 <div className="flex items-center gap-4">
                     {user ? (
                         <>
@@ -68,7 +68,7 @@ export const Home = () => {
                         <Sparkles className="h-3.5 w-3.5" />
                         AI-Powered Research Agent
                     </div>
-                    
+
                     {/* Heading */}
                     <h1 className="text-5xl md:text-7xl font-black text-white tracking-tight leading-[1.1] mb-6">
                         Research smarter with{' '}
@@ -76,13 +76,13 @@ export const Home = () => {
                             MAIRA
                         </span>
                     </h1>
-                    
+
                     {/* Subtitle */}
                     <p className="text-lg md:text-xl text-neutral-400 leading-relaxed max-w-2xl mx-auto mb-10">
-                        Your advanced AI research assistant that browses the web, analyzes papers, 
+                        Your advanced AI research assistant that browses the web, analyzes papers,
                         and generates comprehensive reports with verified sources.
                     </p>
-                    
+
                     {/* CTA Button */}
                     <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
                         <Link
@@ -93,7 +93,7 @@ export const Home = () => {
                             Chat with MAIRA
                             <ArrowRight className="h-5 w-5 group-hover:translate-x-1 transition-transform" />
                         </Link>
-                        
+
                         {!user && (
                             <Link
                                 to="/login"
@@ -103,6 +103,16 @@ export const Home = () => {
                             </Link>
                         )}
                     </div>
+
+                    {/* Paper Writer CTA */}
+                    <Link
+                        to={user ? "/paper-writer" : "/signup"}
+                        className="group flex items-center justify-center gap-3 px-8 py-4 rounded-2xl border border-emerald-500/30 bg-gradient-to-r from-emerald-600/10 to-teal-600/10 text-emerald-400 font-bold text-lg hover:from-emerald-600/20 hover:to-teal-600/20 hover:border-emerald-400/50 transition-all hover:shadow-2xl hover:shadow-emerald-500/20 hover:scale-105 mt-4"
+                    >
+                        <PenLine className="h-5 w-5" />
+                        Write Your Research Paper with AI
+                        <ArrowRight className="h-5 w-5 group-hover:translate-x-1 transition-transform" />
+                    </Link>
                 </div>
 
                 {/* Features Grid */}
@@ -170,7 +180,7 @@ export const Home = () => {
                     <p className="text-neutral-400 mb-16 max-w-xl mx-auto">
                         Get from question to comprehensive research report in three simple steps.
                     </p>
-                    
+
                     <div className="flex flex-col md:flex-row items-center justify-center gap-8">
                         {[
                             { step: '01', title: 'Ask a Question', desc: 'Type your research question or topic' },

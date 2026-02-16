@@ -65,13 +65,16 @@ export const Sidebar = memo(() => {
 
             <div className="flex items-center justify-between px-5 py-6">
                 {!collapsed && (
-                    <div className="flex items-center gap-2.5 font-bold text-xl tracking-tight animate-fade-in">
+                    <button
+                        onClick={() => navigate('/')}
+                        className="flex items-center gap-2.5 font-bold text-xl tracking-tight animate-fade-in hover:opacity-80 transition-opacity"
+                    >
                         <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-blue-600 shadow-lg shadow-blue-500/20">
                             <Shield className="h-5 w-5 text-white" />
                         </div>
                         <span className="text-white">MAIRA</span>
                         <span className="text-[10px] bg-white/10 text-white/50 px-1.5 py-0.5 rounded uppercase tracking-widest font-black">Pro</span>
-                    </div>
+                    </button>
                 )}
                 <button
                     onClick={() => setCollapsed(!collapsed)}
@@ -176,8 +179,8 @@ export const Sidebar = memo(() => {
                         collapsed && "justify-center"
                     )}>
                         {user.user_metadata?.avatar_url ? (
-                            <img 
-                                src={user.user_metadata.avatar_url} 
+                            <img
+                                src={user.user_metadata.avatar_url}
                                 alt="Avatar"
                                 className="h-8 w-8 rounded-lg object-cover"
                             />
@@ -221,7 +224,7 @@ export const Sidebar = memo(() => {
                     </div>
                     {!collapsed && <span className="animate-fade-in">Settings</span>}
                 </button>
-                
+
                 {/* Sign Out */}
                 <button
                     onClick={handleSignOut}

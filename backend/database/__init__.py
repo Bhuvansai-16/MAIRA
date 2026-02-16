@@ -5,6 +5,7 @@ This module handles PostgreSQL (Supabase) connections for:
 - Chat history and checkpoints (short-term)
 - Long-term memory store (persistent across threads)
 - User and thread management
+- Custom personas and user sites
 """
 
 from .postgres import (
@@ -15,6 +16,7 @@ from .postgres import (
     DB_URI, 
     open_all_pools,
     reset_pool,
+    reset_checkpointer_pool,
     validate_pool,
     ensure_healthy_pool,
     _is_transient_error,
@@ -28,6 +30,16 @@ from .postgres import (
     get_thread_by_id,
     update_thread_title,
     delete_thread,
+    # Custom personas
+    create_custom_persona,
+    get_custom_personas,
+    update_custom_persona,
+    delete_custom_persona,
+    # User sites
+    get_user_sites,
+    set_user_sites,
+    add_user_site,
+    remove_user_site,
 )
 
 # Vector store (PGVector + Google Generative AI Embeddings)
@@ -49,6 +61,7 @@ __all__ = [
     'DB_URI',
     'open_all_pools',
     'reset_pool',
+    'reset_checkpointer_pool',
     'validate_pool',
     'ensure_healthy_pool',
     '_is_transient_error',
@@ -62,6 +75,16 @@ __all__ = [
     'get_thread_by_id',
     'update_thread_title',
     'delete_thread',
+    # Custom personas
+    'create_custom_persona',
+    'get_custom_personas',
+    'update_custom_persona',
+    'delete_custom_persona',
+    # User sites
+    'get_user_sites',
+    'set_user_sites',
+    'add_user_site',
+    'remove_user_site',
     # Vector store
     'vector_store',
     'search_knowledge_base',

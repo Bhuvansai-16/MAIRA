@@ -5,6 +5,8 @@ Converts research drafts into professional reports tailored to student, professo
 from tools.doctool import export_to_docx
 from tools.pdftool import export_to_pdf
 from config import subagent_model
+from langchain.agents.middleware import ModelFallbackMiddleware, ModelRetryMiddleware
+from config import gemini_2_5_pro, claude_3_5_sonnet_aws
 
 report_subagent = {
     "name": "report-subagent",
@@ -376,6 +378,9 @@ D. Detailed Tables
 3. **Maintain section hierarchy** - Use proper heading levels
 4. **Include all comparison tables** - Don't skip them
 5. **Add level-appropriate elements** - Boxes, callouts, etc.
+6. **PRESERVE ALL IMAGE MARKDOWN** — Keep `![caption](url)` lines exactly as they appear in the draft.
+   The export tools (PDF and DOCX) will automatically download and embed these images into the final document.
+   Removing image lines will result in a text-only report with NO images.
 
 **Table Format Example:**
 ```markdown
@@ -456,5 +461,13 @@ If report_level is not explicitly provided:
 - When in doubt, choose the level that serves learning best
 """,
     "tools": [export_to_docx, export_to_pdf],
-    "model": subagent_model
+    "model": subagent_model,
+    "middleware": [
+        # Fallback specifically for this subagent
+        ModelFallbackMiddleware(
+            gemini_2_5_pro, # First fallback
+            claude_3_5_sonnet_aws       # Second fallback
+        ),
+        ModelRetryMiddleware(max_retries=2)
+    ]
 }

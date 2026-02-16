@@ -2,15 +2,16 @@ import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import type { ReactNode } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import axios from 'axios';
-import type { CheckpointInfo, VerificationData } from '../types/agent';
+import type { VerificationData, CheckpointInfo } from '../types/agent';
+import type { BackendMessage } from './ThreadContextDefinition';
 import { ThreadContext } from './ThreadContextDefinition';
-import type { Thread, Message, ActiveStep, BackendMessage, ThreadContextType, MessageVersion, MessageMetadata } from './ThreadContextDefinition';
+import type { Thread, Message, ActiveStep, ThreadContextType, MessageVersion, MessageMetadata, CustomPersona } from './ThreadContextDefinition';
 import { useAuth } from './AuthContext';
 import { toast } from 'sonner';
 import { useThreadIDParam } from '../hooks/useThreadIDParam';
 
 // Re-export types for consumers
-export type { Thread, Message, ActiveStep, ThreadContextType, MessageVersion, MessageMetadata };
+export type { Thread, Message, ActiveStep, ThreadContextType, MessageVersion, MessageMetadata, CustomPersona };
 
 const API_BASE = 'http://localhost:8000';
 
@@ -52,7 +53,7 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
         let editVersion: number | undefined;
         let originalMessageIndex: number | undefined;
         let isEdit = false;
-        
+
         const editMetaMatch = content.match(/\[EDIT_META:(\{[^}]+\})\]/);
         if (editMetaMatch) {
             try {
@@ -79,11 +80,14 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
             }));
         }
 
-        // Strip mode and persona tags from stored messages
+        // Strip mode, persona, sites, constraint, and edit meta tags from stored messages
         content = content
             .replace(/\[MODE:.*?\]/g, '')
             .replace(/\[PERSONA:.*?\]/g, '')
             .replace(/\[UPLOADED_FILES:[\s\S]*?\]/g, '') // Use [\s\S] to match newlines if present
+            .replace(/\[SITES:.*?\]/g, '')
+            .replace(/\[CONSTRAINT:[\s\S]*?\]/g, '')  // May span multiple lines
+            .replace(/\[EDIT_META:\{.*?\}\]/g, '')
             .trim();
 
         let downloadData;
@@ -98,7 +102,7 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
             try {
                 const index = content.indexOf(marker);
                 const jsonPart = content.substring(index + marker.length).trim();
-                
+
                 // Use brace counting to find complete JSON
                 let braceCount = 0;
                 let jsonEndIndex = -1;
@@ -112,7 +116,7 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
                         }
                     }
                 }
-                
+
                 if (jsonEndIndex !== -1) {
                     const jsonStr = jsonPart.substring(0, jsonEndIndex + 1);
                     downloadData = JSON.parse(jsonStr);
@@ -147,7 +151,7 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
     // Second pass: Identify which messages are edits and group them
     // Strategy: Messages with isEdit=true should REPLACE original messages
     // originalMessageIndex refers to the Nth user message in conversation order
-    
+
     // First, create a map of user message number -> array index
     const userMessageIndices: number[] = []; // userMessageIndices[n] = index in allMessages of nth user message
     allMessages.forEach((msg, idx) => {
@@ -155,11 +159,11 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
             userMessageIndices.push(idx);
         }
     });
-    
+
     // Build a map: originalMessageIndex (user msg number) -> list of edit versions
     const editsByUserMsgNum = new Map<number, Message[]>();
     const editedMessageIndices = new Set<number>(); // Indices in allMessages that are edits (to skip)
-    
+
     allMessages.forEach((msg, idx) => {
         if (msg.isEdit && msg.originalMessageIndex !== undefined) {
             const userMsgNum = msg.originalMessageIndex;
@@ -175,7 +179,7 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
             }
         }
     });
-    
+
     // Also mark original user messages and their agent responses as skipped if they have edits
     editsByUserMsgNum.forEach((edits, userMsgNum) => {
         if (userMsgNum < userMessageIndices.length) {
@@ -188,8 +192,8 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
         }
     });
 
-    console.log('📊 Edit grouping:', { 
-        userMessageCount: userMessageIndices.length, 
+    console.log('📊 Edit grouping:', {
+        userMessageCount: userMessageIndices.length,
         editGroups: Array.from(editsByUserMsgNum.entries()).map(([k, v]) => ({ userMsgNum: k, editCount: v.length })),
         skippedIndices: Array.from(editedMessageIndices)
     });
@@ -197,24 +201,24 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
     // Third pass: Build final list, replacing originals with their latest edited versions
     const formattedMessages: Message[] = [];
     let userMsgCounter = 0; // Track which user message number we're on
-    
+
     allMessages.forEach((msg, idx) => {
         // Skip messages that are edits (they'll replace their originals)
         if (editedMessageIndices.has(idx)) return;
-        
+
         // Check if this user message has edits that should replace it
         if (msg.role === 'user') {
             const editsForThisUserMsg = editsByUserMsgNum.get(userMsgCounter);
-            
+
             if (editsForThisUserMsg && editsForThisUserMsg.length > 0) {
                 // This is an original message that was edited - show the latest edit with versions
                 const latestEdit = editsForThisUserMsg[editsForThisUserMsg.length - 1];
-                
+
                 // Build versions array including the original
                 const versions: import('./ThreadContextDefinition').MessageVersion[] = [
                     { userContent: msg.content, timestamp: new Date().toISOString() }
                 ];
-                
+
                 // Get corresponding agent responses if they exist
                 const nextMsgIdx = idx + 1;
                 const nextMsg = allMessages[nextMsgIdx];
@@ -223,13 +227,13 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
                     versions[0].agentReasoning = nextMsg.reasoning;
                     versions[0].agentDownload = nextMsg.download;
                 }
-                
+
                 // Add edited versions
                 editsForThisUserMsg.forEach((editMsg) => {
                     // Find the agent response for this edit
                     const editMsgIdx = allMessages.indexOf(editMsg);
                     const editAgentMsg = allMessages[editMsgIdx + 1];
-                    
+
                     versions.push({
                         userContent: editMsg.content,
                         agentContent: editAgentMsg?.role === 'agent' ? editAgentMsg.content : undefined,
@@ -238,9 +242,9 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
                         timestamp: new Date().toISOString()
                     });
                 });
-                
+
                 const editGroupId = latestEdit.editGroupId || `auto_${userMsgCounter}`;
-                
+
                 // Push the latest user version with all versions data
                 formattedMessages.push({
                     ...latestEdit,
@@ -248,7 +252,7 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
                     currentVersionIndex: versions.length - 1,
                     editGroupId
                 });
-                
+
                 // Push the latest agent version
                 const latestEditIdx = allMessages.indexOf(latestEdit);
                 const latestAgentMsg = allMessages[latestEditIdx + 1];
@@ -268,14 +272,14 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
                         editGroupId
                     });
                 }
-                
+
                 userMsgCounter++;
                 return;
             }
-            
+
             userMsgCounter++;
         }
-        
+
         // Regular message - just add it
         formattedMessages.push(msg);
     });
@@ -284,25 +288,25 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
     const mergedMessages = formattedMessages.reduce((acc: Message[], msg) => {
         if (msg.role === 'agent') {
             const prevMsg = acc[acc.length - 1];
-            
+
             if (msg.download && prevMsg && prevMsg.role === 'agent') {
                 prevMsg.download = msg.download;
                 if (msg.content !== 'Report generated successfully! Click below to download.') {
-                     prevMsg.content = `${prevMsg.content}\n\n${msg.content}`;
+                    prevMsg.content = `${prevMsg.content}\n\n${msg.content}`;
                 }
                 return acc;
             }
-            
+
             if (prevMsg && prevMsg.role === 'agent' && prevMsg.download) {
-                 if (prevMsg.content === 'Report generated successfully! Click below to download.') {
-                     prevMsg.content = msg.content;
-                     return acc;
-                 }
-                 prevMsg.content = `${prevMsg.content}\n\n${msg.content}`;
-                 return acc;
+                if (prevMsg.content === 'Report generated successfully! Click below to download.') {
+                    prevMsg.content = msg.content;
+                    return acc;
+                }
+                prevMsg.content = `${prevMsg.content}\n\n${msg.content}`;
+                return acc;
             }
         }
-        
+
         acc.push(msg);
         return acc;
     }, []);
@@ -325,7 +329,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
     const { threadId: urlThreadId } = useParams<{ threadId?: string }>();
     const navigate = useNavigate();
     const { user } = useAuth();
-    
+
     const [threads, setThreads] = useState<Thread[]>([]);
     // Don't restore from localStorage until we verify the thread belongs to the current user
     const [currentThreadId, setCurrentThreadId] = useState<string | null>(null);
@@ -337,11 +341,27 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
     const [isLoadingThreads, setIsLoadingThreads] = useState(false);
     const [isReconnecting, setIsReconnecting] = useState(false); // Track reconnection status
     const [reconnectOnMount, setReconnectOnMount] = useState(true); // Control auto-reconnect behavior
-    
+
     // Internal state for toggles (wrappers below handle logic)
     const [deepResearch, setDeepResearch_internal] = useState(false);
     const [literatureSurvey, setLiteratureSurvey_internal] = useState(false);
-    const [persona, setPersona] = useState<string>("default");
+    const [persona, setPersona] = useState<string>(() => {
+        try { return localStorage.getItem('maira_persona') || 'default'; } catch { return 'default'; }
+    });
+    const [sites, setSites] = useState<string[]>(() => {
+        try {
+            const cached = localStorage.getItem('maira_sites');
+            return cached ? JSON.parse(cached) : [];
+        } catch { return []; }
+    });
+    // New state to toggle site restriction without clearing the list
+    const [isSiteRestrictionEnabled, setIsSiteRestrictionEnabled] = useState<boolean>(() => {
+        try {
+            const cached = localStorage.getItem('maira_site_restriction');
+            return cached ? JSON.parse(cached) : false;
+        } catch { return false; }
+    });
+    const [customPersonas, setCustomPersonas] = useState<CustomPersona[]>([]);
     const [showThinking, setShowThinking] = useState(false);
 
     // Ensure only one research mode is active at a time
@@ -356,7 +376,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
     }, []);
     const [lastEventId, setLastEventId] = useState<string | null>(null);
     const [activeSteps, setActiveSteps] = useState<Record<string, ActiveStep>>({});
-    
+
     // Reconnection state
     const reconnectAttempts = useRef(0);
     const maxReconnectAttempts = 3;
@@ -366,10 +386,99 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
     // Track if initial mount reconnect check has been done
     const hasCheckedReconnectRef = useRef(false);
 
-    // Debug: Log persona changes
+    // Persist persona to localStorage
     useEffect(() => {
         console.log('👤 Persona changed to:', persona);
+        try { localStorage.setItem('maira_persona', persona); } catch { }
     }, [persona]);
+
+    // Persist sites to localStorage (fast cache; Supabase is source of truth)
+    useEffect(() => {
+        try { localStorage.setItem('maira_sites', JSON.stringify(sites)); } catch { }
+    }, [sites]);
+
+    // Persist site restriction enablement
+    useEffect(() => {
+        try { localStorage.setItem('maira_site_restriction', JSON.stringify(isSiteRestrictionEnabled)); } catch { }
+    }, [isSiteRestrictionEnabled]);
+
+    // ── Custom Personas ──
+    const loadCustomPersonas = useCallback(async () => {
+        if (!user?.id) return;
+        try {
+            const response = await axios.get(`${API_BASE}/personas?user_id=${user.id}`);
+            setCustomPersonas(response.data);
+        } catch (error) {
+            console.error('Failed to load custom personas:', error);
+        }
+    }, [user?.id]);
+
+    const addCustomPersona = useCallback(async (name: string, instructions: string) => {
+        if (!user?.id) return;
+        try {
+            await axios.post(`${API_BASE}/personas`, {
+                user_id: user.id,
+                name,
+                instructions
+            });
+            await loadCustomPersonas();
+        } catch (error) {
+            console.error('Failed to create custom persona:', error);
+            throw error;
+        }
+    }, [user?.id, loadCustomPersonas]);
+
+    const deleteCustomPersona = useCallback(async (personaId: string) => {
+        if (!user?.id) return;
+        try {
+            await axios.delete(`${API_BASE}/personas/${personaId}?user_id=${user.id}`);
+            await loadCustomPersonas();
+        } catch (error) {
+            console.error('Failed to delete custom persona:', error);
+            throw error;
+        }
+    }, [user?.id, loadCustomPersonas]);
+
+    const getCustomPersonaInstructions = useCallback((personaIdentifier: string): string | null => {
+        // personaIdentifier is "custom-<persona_id>"
+        const id = personaIdentifier.replace('custom-', '');
+        const cp = customPersonas.find(p => p.persona_id === id);
+        return cp?.instructions || null;
+    }, [customPersonas]);
+
+    // ── Persistent Sites ──
+    const loadSavedSites = useCallback(async () => {
+        if (!user?.id) return;
+        try {
+            const response = await axios.get(`${API_BASE}/user-sites?user_id=${user.id}`);
+            const savedSites: string[] = response.data.sites || [];
+            setSites(savedSites);  // Always set — even if empty (clears stale cache)
+            console.log(`🌐 Loaded ${savedSites.length} sites from Supabase`);
+        } catch (error) {
+            console.error('Failed to load saved sites:', error);
+            // Keep localStorage-cached sites as fallback
+        }
+    }, [user?.id]);
+
+    const saveSites = useCallback(async (newSites: string[]) => {
+        if (!user?.id) return;
+        try {
+            await axios.put(`${API_BASE}/user-sites`, {
+                user_id: user.id,
+                urls: newSites
+            });
+        } catch (error) {
+            console.error('Failed to save sites:', error);
+        }
+    }, [user?.id]);
+
+    // Load custom personas and saved sites when user changes
+    useEffect(() => {
+        if (user?.id) {
+            loadCustomPersonas();
+            loadSavedSites();
+        }
+    }, [user?.id, loadCustomPersonas, loadSavedSites]);
 
     // Persist current thread ID to localStorage
     useEffect(() => {
@@ -444,7 +553,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
     const selectThread = useCallback(async (threadId: string) => {
         // Guard: skip if already on this thread or if another selection is in progress
         if (isSelectingRef.current) return;
-        
+
         isSelectingRef.current = true;
         setCurrentThreadId(threadId);
         setIsLoading(true);
@@ -453,7 +562,42 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
             const response = await axios.get(`${API_BASE}/threads/${threadId}/messages`);
             const messages = response.data.messages || [];
             const formattedMessages = formatMessagesFromBackend(messages);
-            
+
+            // Check if any messages have download markers but no data (history reload).
+            // If so, fetch the actual file data from Supabase Storage.
+            const needsDownloadData = formattedMessages.some(
+                (m) => m.download && !m.download.data
+            );
+            if (needsDownloadData) {
+                try {
+                    const dlResp = await axios.get(`${API_BASE}/threads/${threadId}/downloads`);
+                    const downloads: { filename: string; data: string; file_type: string }[] =
+                        dlResp.data.downloads || [];
+                    if (downloads.length > 0) {
+                        console.log(`☁️ Restored ${downloads.length} download(s) from Supabase`);
+                        for (const msg of formattedMessages) {
+                            if (msg.download && !msg.download.data) {
+                                // Match by filename (strip extensions for fuzzy match)
+                                const match = downloads.find(
+                                    (d) =>
+                                        d.filename === msg.download!.filename ||
+                                        d.filename.replace(/\.\w+$/, '') ===
+                                        msg.download!.filename.replace(/\.\w+$/, '')
+                                );
+                                if (match) {
+                                    msg.download = {
+                                        filename: match.filename,
+                                        data: match.data,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                } catch (dlErr) {
+                    console.warn('⚠️ Could not fetch downloads from Supabase:', dlErr);
+                }
+            }
+
             setCurrentMessages(formattedMessages);
         } catch (error) {
             console.error('Failed to load thread messages:', error);
@@ -474,7 +618,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         try {
             console.log('🔄 Attempting to reconnect to stream for thread:', threadId);
             const response = await fetch(`${API_BASE}/sessions/${threadId}/stream?from_index=0`);
-            
+
             if (!response.ok) {
                 // If 404 or other error, it means no active run exists
                 console.log('ℹ️ No active stream found for this thread');
@@ -495,10 +639,10 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
             // Ensure we have a placeholder if needed - using functional update to get latest state
             setCurrentMessages(prev => {
                 if (prev.length === 0) return prev;
-                
+
                 const updated = [...prev];
                 const lastMsg = updated[updated.length - 1];
-                
+
                 // If last message is from user, append a placeholder
                 if (lastMsg.role === 'user') {
                     updated.push({
@@ -509,7 +653,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                     });
                     return updated;
                 }
-                
+
                 // If last message is from agent but not streaming, mark it as streaming
                 if (lastMsg.role === 'agent') {
                     updated[updated.length - 1] = {
@@ -519,7 +663,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                     };
                     return updated;
                 }
-                
+
                 return updated;
             });
 
@@ -538,7 +682,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                         try {
                             const data = JSON.parse(line.slice(6));
                             // console.log('Reconnect SSE data:', data);
-                            
+
                             if (data.type === 'ping') continue;
 
                             // Handle real-time status updates (Sync with sendMessage logic)
@@ -555,13 +699,13 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                                             timestamp: Date.now()
                                         }
                                     }));
-                                    
+
                                     // Update streaming message status text
                                     if (step === 'start') {
                                         setCurrentMessages(prev => {
                                             const updated = [...prev];
                                             const lastIdx = updated.length - 1;
-                                            
+
                                             // Verify the last message is the one we are streaming
                                             if (updated[lastIdx]?.type === 'streaming') {
                                                 updated[lastIdx] = {
@@ -603,13 +747,13 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                                 const messages = data.messages;
                                 if (messages.length > 0) {
                                     const msg = messages[messages.length - 1];
-                                    
+
                                     if (msg.content && msg.type !== 'human') {
                                         accumulatedContent += msg.content;
                                         setCurrentMessages(prev => {
                                             const updated = [...prev];
                                             const lastIdx = updated.length - 1;
-                                            
+
                                             // Handle case where we need to Append a new message vs Update existing
                                             if (updated[lastIdx]?.type === 'streaming') {
                                                 updated[lastIdx] = {
@@ -688,27 +832,27 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
             // Only run once on mount
             if (hasHandledUrlThreadRef.current) return;
             if (!user?.id) return;
-            
+
             // If URL has a thread ID, prioritize it
             if (urlThreadId) {
                 hasHandledUrlThreadRef.current = true;
                 console.log('🔗 Restoring thread from URL:', urlThreadId);
-                
+
                 try {
                     // Verify thread belongs to current user
                     const response = await axios.get(`${API_BASE}/threads?user_id=${user.id}`);
                     const userThreads = response.data as Thread[];
                     const threadBelongsToUser = userThreads.some(t => t.thread_id === urlThreadId);
-                    
+
                     if (threadBelongsToUser) {
                         // Update localStorage to match URL
                         localStorage.setItem('maira_current_thread_id', urlThreadId);
                         // Select the thread and load its messages
                         await selectThread(urlThreadId);
-                        
+
                         // Attempt to reconnect if enabled
                         if (reconnectOnMount) {
-                             reconnectToStream(urlThreadId);
+                            reconnectToStream(urlThreadId);
                         }
                     } else {
                         console.log('⚠️ URL thread does not belong to current user, redirecting');
@@ -724,17 +868,17 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                 const savedThreadId = localStorage.getItem('maira_current_thread_id');
                 if (savedThreadId) {
                     console.log('💾 Restoring thread from localStorage:', savedThreadId);
-                    
+
                     try {
                         const response = await axios.get(`${API_BASE}/threads?user_id=${user.id}`);
                         const userThreads = response.data as Thread[];
                         const threadBelongsToUser = userThreads.some(t => t.thread_id === savedThreadId);
-                        
+
                         if (threadBelongsToUser) {
                             await selectThread(savedThreadId);
                             // Update URL to match
                             navigate(`/chat/${savedThreadId}`, { replace: true });
-                            
+
                             // Attempt to reconnect if enabled
                             if (reconnectOnMount) {
                                 reconnectToStream(savedThreadId);
@@ -750,7 +894,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                 }
             }
         };
-        
+
         restoreFromUrl();
     }, [user?.id, urlThreadId, selectThread, navigate, reconnectOnMount, reconnectToStream]);
 
@@ -819,13 +963,13 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
     // Stop streaming response
     const stopStream = useCallback(async () => {
         console.log('🛑 Stopping stream generation...');
-        
+
         // 1. Abort frontend SSE connection
         if (abortControllerRef.current) {
             abortControllerRef.current.abort();
             abortControllerRef.current = null;
         }
-        
+
         // 2. Call backend cancel endpoint to stop the agent
         if (currentThreadId) {
             try {
@@ -835,9 +979,9 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                 console.warn('Failed to cancel backend agent (may have already completed):', error);
             }
         }
-        
+
         setIsLoading(false);
-        
+
         // Update the last message to indicate interruption if it was streaming
         setCurrentMessages(prev => {
             const updated = [...prev];
@@ -852,14 +996,14 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
             }
             return updated;
         });
-        
+
         setActiveSteps({});
     }, [currentThreadId]);
 
     // Send a message with SSE streaming
     const sendMessage = useCallback(async (prompt: string, parentCheckpointId?: string, attachments?: { name: string; type: 'file' | 'image' }[]) => {
         if (!prompt.trim() || isLoading) return;
-        
+
         // Require user to be logged in for new threads
         if (!currentThreadId && !user?.id) {
             console.error('User must be logged in to start a new chat');
@@ -871,7 +1015,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
             abortControllerRef.current.abort();
         }
         abortControllerRef.current = new AbortController();
-        
+
         // Clear active steps from previous run
         setActiveSteps({});
 
@@ -881,6 +1025,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
             const fileList = attachments.map(a => a.name).join(', ');
             agentPrompt = `[UPLOADED_FILES: ${fileList}]\n${prompt}`;
         }
+        // Sites are sent via the request body 'sites' field — no need to prefix the prompt
 
         // Add user message immediately and finalize any interrupted streaming messages
         setCurrentMessages(prev => {
@@ -908,7 +1053,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         let verificationData: VerificationData | undefined = undefined;
         let responseComplete = false; // Track when we have a complete response
         const seenContentHashes = new Set<string>(); // Deduplicate content from backend
-        
+
         // Unique session ID to prevent race conditions with previous requests
         const streamingSessionId = `stream_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
@@ -929,7 +1074,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                 try {
                     // Extract potential JSON part (everything after marker)
                     const jsonPart = content.substring(index + marker.length).trim();
-                    
+
                     // Use brace counting to find complete JSON object
                     let braceCount = 0;
                     let jsonEndIndex = -1;
@@ -964,13 +1109,13 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         // Helper to parse verification markers from content
         const parseVerificationContent = (content: string): { cleanContent: string; verification?: VerificationData } => {
             const verificationMarker = '[VERIFICATION]';
-            
+
             if (content.includes(verificationMarker)) {
                 const index = content.indexOf(verificationMarker);
-                
+
                 try {
                     const jsonPart = content.substring(index + verificationMarker.length).trim();
-                    
+
                     // Use brace counting to find complete JSON object
                     let braceCount = 0;
                     let jsonEndIndex = -1;
@@ -984,7 +1129,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                             }
                         }
                     }
-                    
+
                     if (jsonEndIndex !== -1) {
                         const jsonStr = jsonPart.substring(0, jsonEndIndex + 1);
                         const verification = JSON.parse(jsonStr) as VerificationData;
@@ -996,7 +1141,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                     console.warn('Failed to parse verification data JSON:', e);
                 }
             }
-            
+
             return { cleanContent: content };
         };
 
@@ -1006,7 +1151,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         const getVerificationStatus = (toolNames: string[]): string => {
             const verificationTools = ['validate_citations', 'fact_check_claims', 'assess_content_quality', 'cross_reference_sources', 'verify_draft_completeness'];
             const activeVerification = toolNames.find(name => verificationTools.includes(name));
-            
+
             if (activeVerification) {
                 switch (activeVerification) {
                     case 'validate_citations': return '🔗 Validating citations...';
@@ -1023,15 +1168,15 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         // Reconnection logic
         const connectStream = async (retryCount = 0): Promise<void> => {
             try {
-                const requestBody: Record<string, unknown> = { 
-                    prompt: agentPrompt, 
+                const requestBody: Record<string, unknown> = {
+                    prompt: agentPrompt,
                     thread_id: currentThreadId,
                     user_id: user?.id, // Required for new thread creation + multi-tenant RAG
-                    deep_research: deepResearch,
-                    literature_survey: literatureSurvey,
-                    persona: persona
+                    deep_research: deepResearch, // Pass the deepResearch toggle state
+                    literature_survey: literatureSurvey, // Pass literature survey toggle state
+                    persona: persona, // Pass selected persona
+                    sites: ((deepResearch || literatureSurvey) && isSiteRestrictionEnabled && sites.length > 0) ? sites : undefined, // Only pass sites if enabled and non-empty
                 };
-                
                 // Debug logging
                 console.log('🚀 Sending request to backend:');
                 console.log('   👤 User ID:', user?.id);
@@ -1039,12 +1184,12 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                 console.log('   🔍 Deep Research:', deepResearch);
                 console.log('   📚 Literature Survey:', literatureSurvey);
                 console.log('   📦 Full request body:', requestBody);
-                
+
                 // For branching: include parent checkpoint ID
                 if (parentCheckpointId) {
                     requestBody.parent_checkpoint_id = parentCheckpointId;
                 }
-                
+
                 // For reconnection: include last event ID
                 if (lastEventId && retryCount > 0) {
                     requestBody.last_event_id = lastEventId;
@@ -1072,11 +1217,11 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                 // Explicitly set reasoning to undefined to prevent showing stale reasoning from previous messages
                 // Include streamingSessionId to prevent race conditions with previous requests
                 if (retryCount === 0) {
-                    setCurrentMessages(prev => [...prev, { 
-                        role: 'agent', 
-                        content: '', 
-                        status: 'Thinking...', 
-                        type: 'streaming', 
+                    setCurrentMessages(prev => [...prev, {
+                        role: 'agent',
+                        content: '',
+                        status: 'Thinking...',
+                        type: 'streaming',
                         reasoning: undefined,
                         message_id: streamingSessionId  // Unique ID for this streaming session
                     }]);
@@ -1098,15 +1243,15 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                             try {
                                 const data = JSON.parse(line.slice(6));
                                 console.log('SSE data:', data); // Debug log
-                                
+
                                 // Skip ping events (keepalive)
                                 if (data.type === 'ping') continue;
-                                
+
                                 // Track event ID for reconnection
                                 if (data.event_id) {
                                     setLastEventId(data.event_id);
                                 }
-                                
+
                                 // Handle already_running status (session reconnect)
                                 if (data.status === 'already_running') {
                                     console.log('Session already running, subscribing to existing stream');
@@ -1123,7 +1268,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                                     setActiveSteps({});
                                 } else if (data.type === 'status') {
                                     // Handle real-time status updates for tools/subagents
-                                    const { tool, step, message } = data;
+                                    const { tool, step, message, progress } = data;
                                     if (tool) {
                                         setActiveSteps(prev => ({
                                             ...prev,
@@ -1134,7 +1279,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                                                 timestamp: Date.now()
                                             }
                                         }));
-                                        
+
                                         // Update streaming message status with current tool
                                         if (step === 'start') {
                                             setCurrentMessages(prev => {
@@ -1145,6 +1290,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                                                     updated[streamingIdx] = {
                                                         ...updated[streamingIdx],
                                                         status: message || `Running ${tool}...`,
+                                                        progress: progress,
                                                         // Ensure reasoning is only from current session
                                                         reasoning: hasReceivedReasoning ? accumulatedReasoning : undefined
                                                     };
@@ -1160,7 +1306,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                                         accumulatedReasoning += reasoningText;
                                         hasReceivedReasoning = true; // Mark that we received actual reasoning
                                     }
-                                    
+
                                     setCurrentMessages(prev => {
                                         const updated = [...prev];
                                         const streamingIdx = updated.findIndex(m => m.message_id === streamingSessionId && m.type === 'streaming');
@@ -1195,214 +1341,214 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                                         });
                                     }
                                 } else if (data.type === 'update' && data.messages) {
-                                // Process messages from the update
-                                for (const msg of data.messages) {
-                                    console.log('Processing msg:', msg); // Debug log
+                                    // Process messages from the update
+                                    for (const msg of data.messages) {
+                                        console.log('Processing msg:', msg); // Debug log
 
-                                    // Helper to extract content (handles array format from Gemini)
-                                    const extractContent = (content: string | Array<{ text?: string }>): string => {
-                                        if (typeof content === 'string') return content;
-                                        if (Array.isArray(content)) {
-                                            return content
-                                                .map(c => c.text || '')
-                                                .join('');
-                                        }
-                                        return '';
-                                    };
-
-                                    // Check if this is a tool call (show status)
-                                    if (msg.tool_calls && msg.tool_calls.length > 0) {
-                                        const toolNames = msg.tool_calls.map((tc: { name: string }) => tc.name);
-                                        const status = getVerificationStatus(toolNames);
-
-                                        // Check if this is a verification tool - set verifying status
-                                        const verificationTools = ['validate_citations', 'fact_check_claims', 'assess_content_quality', 'cross_reference_sources', 'verify_draft_completeness'];
-                                        const isVerifying = toolNames.some((name: string) => verificationTools.includes(name));
-
-                                        setCurrentMessages(prev => {
-                                            const updated = [...prev];
-                                            const streamingIdx = updated.findIndex(m => m.message_id === streamingSessionId && m.type === 'streaming');
-                                            if (streamingIdx !== -1) {
-                                                updated[streamingIdx] = { 
-                                                    ...updated[streamingIdx], 
-                                                    status,
-                                                    verification: isVerifying ? {
-                                                        ...updated[streamingIdx].verification,
-                                                        status: 'VERIFYING',
-                                                        overallScore: 0,
-                                                        timestamp: new Date().toISOString()
-                                                    } : updated[streamingIdx].verification
-                                                };
+                                        // Helper to extract content (handles array format from Gemini)
+                                        const extractContent = (content: string | Array<{ text?: string }>): string => {
+                                            if (typeof content === 'string') return content;
+                                            if (Array.isArray(content)) {
+                                                return content
+                                                    .map(c => c.text || '')
+                                                    .join('');
                                             }
-                                            return updated;
-                                        });
-                                    }
-                                    else if (msg.content && msg.type !== 'human') {
-                                        const textContent = extractContent(msg.content);
-                                        let cleanContent = textContent
-                                            .replace(/\[MODE:.*?\]/g, '')
-                                            .replace(/\[PERSONA:.*?\]/g, '')  // Strip persona tags
-                                            .trim();
+                                            return '';
+                                        };
 
-                                        if (cleanContent) {
-                                            // Deduplicate: skip content we've already processed
-                                            // Use first 200 chars as fingerprint (matches backend logic)
-                                            const contentFingerprint = cleanContent.substring(0, 200);
-                                            if (seenContentHashes.has(contentFingerprint)) {
-                                                console.log('⏭️ Skipping duplicate content on frontend');
-                                                continue;
-                                            }
-                                            seenContentHashes.add(contentFingerprint);
-                                            
-                                            // Parse verification data first
-                                            const verificationParsed = parseVerificationContent(cleanContent);
-                                            cleanContent = verificationParsed.cleanContent;
-                                            if (verificationParsed.verification) {
-                                                verificationData = verificationParsed.verification;
-                                            }
+                                        // Check if this is a tool call (show status)
+                                        if (msg.tool_calls && msg.tool_calls.length > 0) {
+                                            const toolNames = msg.tool_calls.map((tc: { name: string }) => tc.name);
+                                            const status = getVerificationStatus(toolNames);
 
-                                            const parsed = parseDownloadContent(cleanContent);
+                                            // Check if this is a verification tool - set verifying status
+                                            const verificationTools = ['validate_citations', 'fact_check_claims', 'assess_content_quality', 'cross_reference_sources', 'verify_draft_completeness'];
+                                            const isVerifying = toolNames.some((name: string) => verificationTools.includes(name));
 
-                                            // Main agent content - accumulate it
-                                            // Only add non-empty, non-placeholder content
-                                            if (parsed.cleanContent && 
-                                                parsed.cleanContent !== 'Report generated successfully! Click below to download.') {
-                                                // Add separator if we already have content
-                                                if (accumulatedContent && !accumulatedContent.endsWith('\n\n')) {
-                                                    accumulatedContent += '\n\n';
-                                                }
-                                                accumulatedContent += parsed.cleanContent;
-                                            }
-                                            
-                                            if (parsed.download) {
-                                                downloadData = parsed.download;
-                                                // Don't set responseComplete here - wait for 'done' event
-                                                console.log("📥 Download data received, waiting for done event");
-                                            }
-
-                                            // Only update UI if we have meaningful content OR the response is complete
-                                            // This prevents showing partial "Thinking..." states after content arrives
-                                            const hasContent = accumulatedContent.length > 50; // Minimum meaningful content
-                                            
                                             setCurrentMessages(prev => {
                                                 const updated = [...prev];
-                                                // Find the message with matching streamingSessionId to avoid race conditions
                                                 const streamingIdx = updated.findIndex(m => m.message_id === streamingSessionId && m.type === 'streaming');
                                                 if (streamingIdx !== -1) {
-                                                    // Show content progressively, but keep streaming state until done
-                                                    // Preserve reasoning ONLY if we've received it this session, otherwise clear it
                                                     updated[streamingIdx] = {
-                                                        role: 'agent',
-                                                        message_id: streamingSessionId,
-                                                        content: accumulatedContent || '',
-                                                        status: hasContent ? undefined : updated[streamingIdx].status, // Keep status if no real content yet
-                                                        reasoning: hasReceivedReasoning ? accumulatedReasoning : undefined, // Clear stale reasoning
-                                                        download: downloadData,
-                                                        verification: verificationData,
-                                                        type: 'streaming' // Always stay streaming until done event
+                                                        ...updated[streamingIdx],
+                                                        status,
+                                                        verification: isVerifying ? {
+                                                            ...updated[streamingIdx].verification,
+                                                            status: 'VERIFYING',
+                                                            overallScore: 0,
+                                                            timestamp: new Date().toISOString()
+                                                        } : updated[streamingIdx].verification
                                                     };
                                                 }
                                                 return updated;
                                             });
                                         }
-                                    }
-                                }
-                            } else if (data.type === 'done') {
-                                // Finalize the message and stop loading
-                                responseComplete = true;
-                                setIsLoading(false);
-                                
-                                // Clear active steps when done
-                                setActiveSteps({});
-                                
-                                console.log("✅ Done event received. Content length:", accumulatedContent.length, "Has download:", !!downloadData);
+                                        else if (msg.content && msg.type !== 'human') {
+                                            const textContent = extractContent(msg.content);
+                                            let cleanContent = textContent
+                                                .replace(/\[MODE:.*?\]/g, '')
+                                                .replace(/\[PERSONA:.*?\]/g, '')  // Strip persona tags
+                                                .trim();
 
-                                setCurrentMessages(prev => {
-                                    const updated = [...prev];
-                                    const streamingIdx = updated.findIndex(m => m.message_id === streamingSessionId);
-                                    if (streamingIdx !== -1 && updated[streamingIdx]?.role === 'agent') {
-                                        // Use accumulated content, or existing content, or fallback
-                                        let finalContent = accumulatedContent || updated[streamingIdx].content;
+                                            if (cleanContent) {
+                                                // Deduplicate: skip content we've already processed
+                                                // Use first 200 chars as fingerprint (matches backend logic)
+                                                const contentFingerprint = cleanContent.substring(0, 200);
+                                                if (seenContentHashes.has(contentFingerprint)) {
+                                                    console.log('⏭️ Skipping duplicate content on frontend');
+                                                    continue;
+                                                }
+                                                seenContentHashes.add(contentFingerprint);
 
-                                        // Only use placeholder if we have download but no real content
-                                        if (!finalContent && (downloadData || updated[streamingIdx].download)) {
-                                            finalContent = 'Report generated successfully! Click below to download.';
-                                        } else if (!finalContent) {
-                                            finalContent = "I couldn't generate a response.";
+                                                // Parse verification data first
+                                                const verificationParsed = parseVerificationContent(cleanContent);
+                                                cleanContent = verificationParsed.cleanContent;
+                                                if (verificationParsed.verification) {
+                                                    verificationData = verificationParsed.verification;
+                                                }
+
+                                                const parsed = parseDownloadContent(cleanContent);
+
+                                                // Main agent content - accumulate it
+                                                // Only add non-empty, non-placeholder content
+                                                if (parsed.cleanContent &&
+                                                    parsed.cleanContent !== 'Report generated successfully! Click below to download.') {
+                                                    // Add separator if we already have content
+                                                    if (accumulatedContent && !accumulatedContent.endsWith('\n\n')) {
+                                                        accumulatedContent += '\n\n';
+                                                    }
+                                                    accumulatedContent += parsed.cleanContent;
+                                                }
+
+                                                if (parsed.download) {
+                                                    downloadData = parsed.download;
+                                                    // Don't set responseComplete here - wait for 'done' event
+                                                    console.log("📥 Download data received, waiting for done event");
+                                                }
+
+                                                // Only update UI if we have meaningful content OR the response is complete
+                                                // This prevents showing partial "Thinking..." states after content arrives
+                                                const hasContent = accumulatedContent.length > 50; // Minimum meaningful content
+
+                                                setCurrentMessages(prev => {
+                                                    const updated = [...prev];
+                                                    // Find the message with matching streamingSessionId to avoid race conditions
+                                                    const streamingIdx = updated.findIndex(m => m.message_id === streamingSessionId && m.type === 'streaming');
+                                                    if (streamingIdx !== -1) {
+                                                        // Show content progressively, but keep streaming state until done
+                                                        // Preserve reasoning ONLY if we've received it this session, otherwise clear it
+                                                        updated[streamingIdx] = {
+                                                            role: 'agent',
+                                                            message_id: streamingSessionId,
+                                                            content: accumulatedContent || '',
+                                                            status: hasContent ? undefined : updated[streamingIdx].status, // Keep status if no real content yet
+                                                            reasoning: hasReceivedReasoning ? accumulatedReasoning : undefined, // Clear stale reasoning
+                                                            download: downloadData,
+                                                            verification: verificationData,
+                                                            type: 'streaming' // Always stay streaming until done event
+                                                        };
+                                                    }
+                                                    return updated;
+                                                });
+                                            }
                                         }
+                                    }
+                                } else if (data.type === 'done') {
+                                    // Finalize the message and stop loading
+                                    responseComplete = true;
+                                    setIsLoading(false);
 
-                                        updated[streamingIdx] = {
-                                            ...updated[streamingIdx],
-                                            type: undefined, // Remove streaming type
-                                            content: finalContent,
-                                            status: undefined,
-                                            // Only include reasoning if we actually received it this session
-                                            reasoning: hasReceivedReasoning ? accumulatedReasoning : undefined,
-                                            download: downloadData || updated[streamingIdx].download,
-                                            verification: verificationData || updated[streamingIdx].verification
-                                        };
-                                    }
-                                    return updated;
-                                });
-                            } else if (data.type === 'verification' && data.data) {
-                                // Handle verification updates
-                                verificationData = {
-                                    ...verificationData,
-                                    ...data.data,
-                                    timestamp: new Date().toISOString()
-                                } as VerificationData;
-                                
-                                setCurrentMessages(prev => {
-                                    const updated = [...prev];
-                                    const streamingIdx = updated.findIndex(m => m.message_id === streamingSessionId && m.type === 'streaming');
-                                    if (streamingIdx !== -1) {
-                                        updated[streamingIdx] = {
-                                            ...updated[streamingIdx],
-                                            verification: verificationData
-                                        };
-                                    }
-                                    return updated;
-                                });
-                            } else if (data.type === 'error') {
-                                // Handle error event from backend
-                                console.error('Agent error:', data.error);
-                                responseComplete = true;
-                                setIsLoading(false);
-                                
-                                setCurrentMessages(prev => {
-                                    const updated = [...prev];
-                                    const streamingIdx = updated.findIndex(m => m.message_id === streamingSessionId && m.type === 'streaming');
-                                    if (streamingIdx !== -1) {
-                                        // Replace streaming message with error message
-                                        updated[streamingIdx] = {
-                                            role: 'agent',
-                                            message_id: streamingSessionId,
-                                            content: `⚠️ An error occurred: ${data.error}\n\nPlease try again or rephrase your request.`,
-                                            type: undefined,
-                                            status: undefined
-                                        };
-                                    }
-                                    return updated;
-                                });
-                                
-                                // Stop processing further events
-                                throw new Error(data.error);
-                            }
-                        } catch (parseError) {
-                            console.warn('SSE parse error:', parseError, 'Line:', line);
-                        }
-                                    }
+                                    // Clear active steps when done
+                                    setActiveSteps({});
+
+                                    console.log("✅ Done event received. Content length:", accumulatedContent.length, "Has download:", !!downloadData);
+
+                                    setCurrentMessages(prev => {
+                                        const updated = [...prev];
+                                        const streamingIdx = updated.findIndex(m => m.message_id === streamingSessionId);
+                                        if (streamingIdx !== -1 && updated[streamingIdx]?.role === 'agent') {
+                                            // Use accumulated content, or existing content, or fallback
+                                            let finalContent = accumulatedContent || updated[streamingIdx].content;
+
+                                            // Only use placeholder if we have download but no real content
+                                            if (!finalContent && (downloadData || updated[streamingIdx].download)) {
+                                                finalContent = 'Report generated successfully! Click below to download.';
+                                            } else if (!finalContent) {
+                                                finalContent = "I couldn't generate a response.";
+                                            }
+
+                                            updated[streamingIdx] = {
+                                                ...updated[streamingIdx],
+                                                type: undefined, // Remove streaming type
+                                                content: finalContent,
+                                                status: undefined,
+                                                // Only include reasoning if we actually received it this session
+                                                reasoning: hasReceivedReasoning ? accumulatedReasoning : undefined,
+                                                download: downloadData || updated[streamingIdx].download,
+                                                verification: verificationData || updated[streamingIdx].verification
+                                            };
+                                        }
+                                        return updated;
+                                    });
+                                } else if (data.type === 'verification' && data.data) {
+                                    // Handle verification updates
+                                    verificationData = {
+                                        ...verificationData,
+                                        ...data.data,
+                                        timestamp: new Date().toISOString()
+                                    } as VerificationData;
+
+                                    setCurrentMessages(prev => {
+                                        const updated = [...prev];
+                                        const streamingIdx = updated.findIndex(m => m.message_id === streamingSessionId && m.type === 'streaming');
+                                        if (streamingIdx !== -1) {
+                                            updated[streamingIdx] = {
+                                                ...updated[streamingIdx],
+                                                verification: verificationData
+                                            };
+                                        }
+                                        return updated;
+                                    });
+                                } else if (data.type === 'error') {
+                                    // Handle error event from backend
+                                    console.error('Agent error:', data.error);
+                                    responseComplete = true;
+                                    setIsLoading(false);
+
+                                    setCurrentMessages(prev => {
+                                        const updated = [...prev];
+                                        const streamingIdx = updated.findIndex(m => m.message_id === streamingSessionId && m.type === 'streaming');
+                                        if (streamingIdx !== -1) {
+                                            // Replace streaming message with error message
+                                            updated[streamingIdx] = {
+                                                role: 'agent',
+                                                message_id: streamingSessionId,
+                                                content: `⚠️ An error occurred: ${data.error}\n\nPlease try again or rephrase your request.`,
+                                                type: undefined,
+                                                status: undefined
+                                            };
+                                        }
+                                        return updated;
+                                    });
+
+                                    // Stop processing further events
+                                    throw new Error(data.error);
                                 }
+                            } catch (parseError) {
+                                console.warn('SSE parse error:', parseError, 'Line:', line);
                             }
+                        }
+                    }
+                }
 
                 // Refresh threads if new thread was created
                 if (!currentThreadId && newThreadId) {
                     await refreshThreads();
                 }
-                
+
                 // Reset reconnect attempts on success
                 reconnectAttempts.current = 0;
-                
+
             } catch (error: unknown) {
                 const err = error as Error;
                 // Check if error is due to abort (user cancelled)
@@ -1411,7 +1557,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                     setIsLoading(false);
                     return;
                 }
-                
+
                 // Attempt reconnection only for network errors, not agent errors
                 const isAgentError = err.message && err.message.includes('Agent error');
                 if (!isAgentError && retryCount < maxReconnectAttempts && !responseComplete) {
@@ -1420,7 +1566,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                     await new Promise(resolve => setTimeout(resolve, 1000 * (retryCount + 1))); // Exponential backoff
                     return connectStream(retryCount + 1);
                 }
-                
+
                 console.error('Error sending message:', err);
                 setIsLoading(false);  // Ensure loading is stopped
                 setCurrentMessages(prev => {
@@ -1438,9 +1584,9 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                 }
                 abortControllerRef.current = null;
             }
-                if (!responseComplete) {
-                    setIsLoading(false);
-                }
+            if (!responseComplete) {
+                setIsLoading(false);
+            }
         };
 
         // Start the stream connection
@@ -1453,23 +1599,23 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         setCurrentMessages(prev => {
             const updated = [...prev];
             const userMsg = updated[messageIndex];
-            
+
             if (!userMsg || userMsg.role !== 'user' || !userMsg.versions) return prev;
-            
+
             // Clamp versionIndex to valid range
             const clampedIndex = Math.max(0, Math.min(versionIndex, userMsg.versions.length - 1));
             const version = userMsg.versions[clampedIndex];
-            
+
             // Update user message content and version index
             updated[messageIndex] = {
                 ...userMsg,
                 content: version.userContent,
                 currentVersionIndex: clampedIndex
             };
-            
+
             // Find the corresponding agent response (next message with same editGroupId)
             const agentMsgIndex = messageIndex + 1;
-            if (agentMsgIndex < updated.length && updated[agentMsgIndex]?.role === 'agent' && 
+            if (agentMsgIndex < updated.length && updated[agentMsgIndex]?.role === 'agent' &&
                 updated[agentMsgIndex]?.editGroupId === userMsg.editGroupId) {
                 updated[agentMsgIndex] = {
                     ...updated[agentMsgIndex],
@@ -1480,7 +1626,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                     currentVersionIndex: clampedIndex
                 };
             }
-            
+
             return updated;
         });
     }, []);
@@ -1488,31 +1634,31 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
     // Edit a message and trigger regeneration - stores versions like ChatGPT
     const editMessage = useCallback(async (messageIndex: number, newContent: string, parentCheckpointIdOverride?: string) => {
         if (isLoading) return;
-        
+
         // Get the message to edit
         const messageToEdit = currentMessages[messageIndex];
         if (!messageToEdit || messageToEdit.role !== 'user') return;
-        
+
         // Skip if content is the same - unless we are forcing a branch via override
         if (!parentCheckpointIdOverride && messageToEdit.content.trim() === newContent.trim()) return;
-        
+
         // Get checkpoint ID: prioritized explicit override, then previous message's checkpoint
         const previousMessage = messageIndex > 0 ? currentMessages[messageIndex - 1] : null;
         const parentCheckpointId = parentCheckpointIdOverride || previousMessage?.checkpoint_id;
-        
+
         // Find the corresponding agent response
         const agentMsgIndex = messageIndex + 1;
-        const agentResponse = agentMsgIndex < currentMessages.length && currentMessages[agentMsgIndex]?.role === 'agent' 
-            ? currentMessages[agentMsgIndex] 
+        const agentResponse = agentMsgIndex < currentMessages.length && currentMessages[agentMsgIndex]?.role === 'agent'
+            ? currentMessages[agentMsgIndex]
             : null;
-        
+
         // Create unique group ID for this message pair (if not already set)
         const editGroupId = messageToEdit.editGroupId || `edit_${Date.now()}_${messageIndex}`;
-        
+
         // Build versions array
         const existingVersions = messageToEdit.versions || [];
         const currentVersionIdx = messageToEdit.currentVersionIndex ?? (existingVersions.length > 0 ? existingVersions.length - 1 : 0);
-        
+
         // If this is the first edit, save the original as version 0
         let versions: MessageVersion[] = [...existingVersions];
         if (versions.length === 0) {
@@ -1525,7 +1671,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                 timestamp: new Date().toISOString()
             });
         }
-        
+
         // Add the new edited version
         const newVersionIndex = versions.length;
         versions.push({
@@ -1533,11 +1679,11 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
             agentContent: undefined, // Will be populated when response arrives
             timestamp: new Date().toISOString()
         });
-        
+
         // Update messages in place with versioning info
         setCurrentMessages(prev => {
             const updated = [...prev];
-            
+
             // Update user message with version info
             updated[messageIndex] = {
                 ...messageToEdit,
@@ -1546,7 +1692,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                 versions,
                 currentVersionIndex: newVersionIndex
             };
-            
+
             // Update or create agent response placeholder
             if (agentResponse) {
                 updated[agentMsgIndex] = {
@@ -1574,7 +1720,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                 return [...updated.slice(0, messageIndex + 1), agentPlaceholder];
             }
         });
-        
+
         // Now send the edited message and capture the response
         // We need a custom handler to update the version's agent response
         if (!currentThreadId && !user?.id) {
@@ -1742,7 +1888,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
             setIsLoading(false);
             abortControllerRef.current = null;
         }
-    }, [currentMessages, isLoading, currentThreadId, user?.id, deepResearch, literatureSurvey, persona]);
+    }, [currentMessages, isLoading, currentThreadId, user?.id, deepResearch, literatureSurvey, persona, sites]);
 
     // Helper to add upload messages (user notification + agent acknowledgment) to UI
     const addUploadMessage = useCallback((filename: string, type: 'document' | 'image') => {
@@ -1833,6 +1979,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         deepResearch,
         literatureSurvey,
         persona,
+        sites,
         lastEventId,
         activeSteps,
         showThinking,
@@ -1848,6 +1995,15 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         setDeepResearch,
         setLiteratureSurvey,
         setPersona,
+        setSites,
+        isSiteRestrictionEnabled,
+        setIsSiteRestrictionEnabled,
+        customPersonas,
+        addCustomPersona,
+        deleteCustomPersona,
+        getCustomPersonaInstructions,
+        loadSavedSites,
+        saveSites,
         setShowThinking,
         setReconnectOnMount,
         fetchStateHistory,
@@ -1867,6 +2023,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         deepResearch,
         literatureSurvey,
         persona,
+        sites,
         lastEventId,
         activeSteps,
         showThinking,
@@ -1882,13 +2039,21 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         setDeepResearch,
         setLiteratureSurvey,
         setPersona,
+        setSites,
+        customPersonas,
+        addCustomPersona,
+        deleteCustomPersona,
+        getCustomPersonaInstructions,
+        loadSavedSites,
+        saveSites,
         setShowThinking,
         setReconnectOnMount,
         fetchStateHistory,
         branchFromCheckpoint,
         stopStream,
         uploadFile,
-        uploadImage
+        uploadImage,
+        isSiteRestrictionEnabled
     ]);
 
     return (

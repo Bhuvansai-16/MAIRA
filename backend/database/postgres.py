@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from psycopg_pool import ConnectionPool
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.checkpoint.memory import MemorySaver
+from psycopg.rows import dict_row
 
 load_dotenv()
 
@@ -45,13 +46,13 @@ DB_URI = (
 POOL_CONFIG = dict(
     conninfo=DB_URI,
     min_size=1,
-    max_size=3,             # Supabase free-tier connection limit friendly
+    max_size=2,             # Reduced from 3: CRUD ops are fast, save connection budget
     open=False,
-    max_idle=60,            # Close idle connections after 60s (was 120)
-    max_lifetime=300,       # Recycle connections every 5 min (was 10 min)
-    reconnect_timeout=30,   # Wait up to 30s when reconnecting
-    num_workers=2,          # Background workers for health checks
-    check=ConnectionPool.check_connection,  # Validate before handing out
+    max_idle=45,            # Close idle connections after 45s (was 60)
+    max_lifetime=240,       # Recycle every 4 min (was 5 min)
+    reconnect_timeout=30,
+    num_workers=2,
+    check=ConnectionPool.check_connection,
 )
 
 pool = ConnectionPool(**POOL_CONFIG)
@@ -59,13 +60,15 @@ pool = ConnectionPool(**POOL_CONFIG)
 # Dedicated pool for PostgresSaver / PostgresStore — NEVER reset during streaming.
 # This prevents the "pool is already closed" crash when reset_pool() is called
 # while the agent is still saving checkpoints in a background thread.
+# Connection budget: CRUD pool (2) + Checkpointer pool (2) + PGVector (1) = 5 total
+# Well within Supabase free-tier ~20 connection limit
 CHECKPOINTER_POOL_CONFIG = dict(
     conninfo=DB_URI,
     min_size=1,
-    max_size=2,             # Checkpointer needs fewer connections
+    max_size=2,             # Reduced from 3: trimmed checkpoints need less parallelism
     open=False,
-    max_idle=60,
-    max_lifetime=300,
+    max_idle=20,            # Close idle after 20s (was 30) — faster SSL recycle
+    max_lifetime=120,       # Recycle every 2 min (was 3 min) — prevent stale SSL sessions
     reconnect_timeout=30,
     num_workers=2,
     check=ConnectionPool.check_connection,
@@ -112,6 +115,24 @@ def reset_pool():
         pool = ConnectionPool(**POOL_CONFIG)
         pool.open()
         print("🔄 CRUD connection pool reset successfully")
+
+
+def reset_checkpointer_pool():
+    """
+    Reset the checkpointer pool to recover from SSL errors.
+    Called during stream retry when the checkpoint save fails.
+    """
+    global _checkpointer_pool
+    with _pool_lock:
+        old_pool = _checkpointer_pool
+        try:
+            old_pool.close(timeout=5)
+        except Exception:
+            pass
+        
+        _checkpointer_pool = ConnectionPool(**CHECKPOINTER_POOL_CONFIG)
+        _checkpointer_pool.open()
+        print("🔄 Checkpointer pool reset successfully")
 
 
 def validate_pool() -> bool:
@@ -581,3 +602,253 @@ def delete_thread(thread_id: str, user_id: str = None) -> bool:
     except Exception as e:
         print(f"⚠️ Error deleting thread: {e}")
         return False
+
+
+# =====================================================
+# CUSTOM PERSONAS MANAGEMENT
+# =====================================================
+
+@with_db_retry()
+def create_custom_persona(user_id: str, name: str, instructions: str) -> dict | None:
+    """
+    Create a new custom persona for a user.
+    Returns the created persona dict or None on failure.
+    """
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO custom_personas (persona_id, user_id, name, instructions)
+                    VALUES (gen_random_uuid(), %s::uuid, %s, %s)
+                    RETURNING persona_id, name, instructions, created_at
+                    """,
+                    (user_id, name, instructions)
+                )
+                row = cur.fetchone()
+                conn.commit()
+
+                if row:
+                    print(f"✅ Custom persona '{name}' created for user {user_id}")
+                    return {
+                        "persona_id": str(row[0]),
+                        "name": row[1],
+                        "instructions": row[2],
+                        "created_at": row[3].isoformat() if row[3] else None
+                    }
+                return None
+    except Exception as e:
+        print(f"⚠️ Error creating custom persona: {e}")
+        return None
+
+
+@with_db_retry()
+def get_custom_personas(user_id: str) -> list[dict]:
+    """
+    Get all active custom personas for a user.
+    Returns list of persona dicts sorted by creation time.
+    """
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT persona_id, name, instructions, created_at
+                    FROM custom_personas
+                    WHERE user_id = %s::uuid AND is_active = TRUE
+                    ORDER BY created_at ASC
+                    """,
+                    (user_id,)
+                )
+                rows = cur.fetchall()
+                personas = []
+                for row in rows:
+                    personas.append({
+                        "persona_id": str(row[0]),
+                        "name": row[1],
+                        "instructions": row[2],
+                        "created_at": row[3].isoformat() if row[3] else None
+                    })
+                print(f"👤 Found {len(personas)} custom personas for user {user_id}")
+                return personas
+    except Exception as e:
+        print(f"⚠️ Error fetching custom personas: {e}")
+        return []
+
+
+@with_db_retry()
+def update_custom_persona(persona_id: str, user_id: str, name: str = None, instructions: str = None) -> bool:
+    """
+    Update a custom persona's name and/or instructions.
+    Validates ownership via user_id.
+    """
+    try:
+        updates = []
+        params = []
+        if name is not None:
+            updates.append("name = %s")
+            params.append(name)
+        if instructions is not None:
+            updates.append("instructions = %s")
+            params.append(instructions)
+        
+        if not updates:
+            return False
+        
+        params.extend([persona_id, user_id])
+        
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE custom_personas
+                    SET {', '.join(updates)}, updated_at = NOW()
+                    WHERE persona_id = %s::uuid AND user_id = %s::uuid AND is_active = TRUE
+                    RETURNING persona_id
+                    """,
+                    params
+                )
+                result = cur.fetchone()
+                conn.commit()
+                return result is not None
+    except Exception as e:
+        print(f"⚠️ Error updating custom persona: {e}")
+        return False
+
+
+@with_db_retry()
+def delete_custom_persona(persona_id: str, user_id: str) -> bool:
+    """
+    Soft-delete a custom persona (set is_active = FALSE).
+    Validates ownership via user_id.
+    """
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE custom_personas
+                    SET is_active = FALSE, updated_at = NOW()
+                    WHERE persona_id = %s::uuid AND user_id = %s::uuid AND is_active = TRUE
+                    RETURNING persona_id
+                    """,
+                    (persona_id, user_id)
+                )
+                result = cur.fetchone()
+                conn.commit()
+                if result:
+                    print(f"🗑️ Custom persona {persona_id} deleted for user {user_id}")
+                    return True
+                return False
+    except Exception as e:
+        print(f"⚠️ Error deleting custom persona: {e}")
+        return False
+
+
+# =====================================================
+# USER SITES MANAGEMENT
+# =====================================================
+
+@with_db_retry()
+def get_user_sites(user_id: str) -> list[str]:
+    """
+    Get all saved sites for a user.
+    Returns a list of URL strings.
+    """
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT url FROM user_sites
+                    WHERE user_id = %s::uuid
+                    ORDER BY created_at ASC
+                    """,
+                    (user_id,)
+                )
+                rows = cur.fetchall()
+                sites = [row[0] for row in rows]
+                print(f"🌐 Found {len(sites)} saved sites for user {user_id}")
+                return sites
+    except Exception as e:
+        print(f"⚠️ Error fetching user sites: {e}")
+        return []
+
+
+@with_db_retry()
+def set_user_sites(user_id: str, urls: list[str]) -> bool:
+    """
+    Replace all saved sites for a user with the given list.
+    Deletes existing sites and inserts the new ones.
+    """
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                # Delete existing sites
+                cur.execute(
+                    "DELETE FROM user_sites WHERE user_id = %s::uuid",
+                    (user_id,)
+                )
+                # Insert new ones
+                if urls:
+                    values = [(user_id, url) for url in urls]
+                    cur.executemany(
+                        """
+                        INSERT INTO user_sites (site_id, user_id, url)
+                        VALUES (gen_random_uuid(), %s::uuid, %s)
+                        ON CONFLICT (user_id, url) DO NOTHING
+                        """,
+                        values
+                    )
+                conn.commit()
+                print(f"🌐 Saved {len(urls)} sites for user {user_id}")
+                return True
+    except Exception as e:
+        print(f"⚠️ Error saving user sites: {e}")
+        return False
+
+
+@with_db_retry()
+def add_user_site(user_id: str, url: str) -> bool:
+    """Add a single site for a user."""
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO user_sites (site_id, user_id, url)
+                    VALUES (gen_random_uuid(), %s::uuid, %s)
+                    ON CONFLICT (user_id, url) DO NOTHING
+                    RETURNING site_id
+                    """,
+                    (user_id, url)
+                )
+                result = cur.fetchone()
+                conn.commit()
+                return result is not None
+    except Exception as e:
+        print(f"⚠️ Error adding user site: {e}")
+        return False
+
+
+@with_db_retry()
+def remove_user_site(user_id: str, url: str) -> bool:
+    """Remove a single site for a user."""
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM user_sites
+                    WHERE user_id = %s::uuid AND url = %s
+                    RETURNING site_id
+                    """,
+                    (user_id, url)
+                )
+                result = cur.fetchone()
+                conn.commit()
+                return result is not None
+    except Exception as e:
+        print(f"⚠️ Error removing user site: {e}")
+        return False
+

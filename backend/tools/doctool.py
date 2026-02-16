@@ -452,4 +452,4 @@ def export_to_docx(
     
     print(f"  📄 DOCX generated: {clean_filename} ({doc_size_kb:.1f} KB)")
     
-    return f'[DOWNLOAD_DOCX]{{"filename": "{clean_filename}", "data": "{doc_base64}"}}'
+    return f'[DOWNLOAD_DOCX]{{"filename": "{clean_filename}", "status": "stored"}}'

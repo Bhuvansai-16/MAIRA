@@ -24,7 +24,8 @@ from langchain.tools import tool
 from langchain_community.agent_toolkits.github.toolkit import GitHubToolkit
 from langchain_community.utilities.github import GitHubAPIWrapper
 from config import subagent_model
-
+from langchain.agents.middleware import ModelFallbackMiddleware, ModelRetryMiddleware
+from config import gemini_2_5_pro, claude_3_5_sonnet_aws
 load_dotenv()
 
 # GitHub API base URL
@@ -653,9 +654,13 @@ GUIDELINES:
 Note: For private repositories, the GitHub App must be installed with proper permissions.
 """,
     "tools": github_tools,
-    "model": subagent_model
+    "model": subagent_model,
+    "middleware": [
+        # Fallback specifically for this subagent
+        ModelFallbackMiddleware(
+            gemini_2_5_pro, # First fallback
+            claude_3_5_sonnet_aws       # Second fallback
+        ),
+        ModelRetryMiddleware(max_retries=2)
+    ]
 }
-
-
-# Export for use in main agent
-__all__ = ["github_subagent", "github_tools", "analyze_github_repo", "get_github_file_content", "get_github_directory", "search_github_code", "get_github_issues"]

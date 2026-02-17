@@ -11,7 +11,7 @@ class RateLimitedArxivWrapper:
     
     def __init__(
         self,
-        top_k_results: int = 10,
+        top_k_results: int = 5,
         doc_content_chars_max: int = 2000,
         delay_seconds: float = 3.0,  # Delay between requests
         max_retries: int = 5,
@@ -86,7 +86,7 @@ class RateLimitedArxivWrapper:
 
 
 @tool
-def arxiv_search(query: str, max_results: int = 10) -> str:
+def arxiv_search(query: str, max_results: int = 5) -> str:
     """
     Search arXiv for academic papers with rate limiting.
     

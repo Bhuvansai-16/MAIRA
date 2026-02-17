@@ -6,7 +6,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-from main_agent import agent, research_prompt, subagents, tools, checkpointer
+from main_agent import agent, prompt_v2, subagents, tools, checkpointer
 from deepagents import create_deep_agent
 import database as _db
 from database import (
@@ -566,7 +566,7 @@ def select_model(request: ModelSelectRequest, http_request: Request):
             subagents=subagents,  # Now contains updated models
             model=new_model,
             tools=tools,
-            system_prompt=research_prompt,
+            system_prompt=prompt_v2,
             checkpointer=checkpointer,
         )
         
@@ -1512,29 +1512,30 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
         print(f"   🔍 Deep Research: {deep_research}")
         print(f"   📚 Literature Survey: {literature_survey}")
         
-        if persona_value == "student":
-            persona_instruction = "\n[PERSONA: STUDENT - Explain concepts simply, use analogies, be encouraging, avoid jargon]"
-        elif persona_value == "professor":
-            persona_instruction = "\n[PERSONA: PROFESSOR - Be academic, authoritative, cite sources, encourage critical thinking]"
-        elif persona_value == "researcher":
-            persona_instruction = "\n[PERSONA: RESEARCHER - Be technical, data-driven, focus on methodology and results]"
-        elif persona_value.startswith("custom-") and user_id:
-            # Fetch custom persona from DB
-            try:
-                persona_id = persona_value.replace("custom-", "")
-                custom_personas = get_custom_personas(user_id)
-                found_persona = next((p for p in custom_personas if p["persona_id"] == persona_id), None)
-                if found_persona:
-                    # Clean instructions to remove newlines for compact log
-                    safe_instr = found_persona['instructions'].replace('\n', ' ')
-                    persona_instruction = f"\n[PERSONA: {found_persona['name']} - {safe_instr}]"
-                    print(f"   👤 Applied custom persona: {found_persona['name']}")
-            except Exception as e:
-                print(f"   ⚠️ Failed to load custom persona {persona_value}: {e}")
+        if not literature_survey:
+            if persona_value == "student":
+                persona_instruction = "\n[PERSONA: STUDENT - Explain concepts simply, use analogies, be encouraging, avoid jargon]"
+            elif persona_value == "professor":
+                persona_instruction = "\n[PERSONA: PROFESSOR - Be academic, authoritative, cite sources, encourage critical thinking]"
+            elif persona_value == "researcher":
+                persona_instruction = "\n[PERSONA: RESEARCHER - Be technical, data-driven, focus on methodology and results]"
+            elif persona_value.startswith("custom-") and user_id:
+                # Fetch custom persona from DB
+                try:
+                    persona_id = persona_value.replace("custom-", "")
+                    custom_personas = get_custom_personas(user_id)
+                    found_persona = next((p for p in custom_personas if p["persona_id"] == persona_id), None)
+                    if found_persona:
+                        # Clean instructions to remove newlines for compact log
+                        safe_instr = found_persona['instructions'].replace('\n', ' ')
+                        persona_instruction = f"\n[PERSONA: {found_persona['name']} - {safe_instr}]"
+                        print(f"   👤 Applied custom persona: {found_persona['name']}")
+                except Exception as e:
+                    print(f"   ⚠️ Failed to load custom persona {persona_value}: {e}")
+                    persona_instruction = "\n[PERSONA: DEFAULT - Professional, balanced research assistant style]"
+            else:
+                # Even for "default", add a tag so agents are aware
                 persona_instruction = "\n[PERSONA: DEFAULT - Professional, balanced research assistant style]"
-        else:
-            # Even for "default", add a tag so agents are aware
-            persona_instruction = "\n[PERSONA: DEFAULT - Professional, balanced research assistant style]"
         
         # Initialize user content
         user_content = f"{mode_prefix}{prompt}{persona_instruction}"

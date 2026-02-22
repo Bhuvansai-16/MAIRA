@@ -8,22 +8,148 @@ import { ThreadContext } from './ThreadContextDefinition';
 import type { Thread, Message, ActiveStep, ThreadContextType, MessageVersion, MessageMetadata, CustomPersona } from './ThreadContextDefinition';
 import { useAuth } from './AuthContext';
 import { toast } from 'sonner';
-import { useThreadIDParam } from '../hooks/useThreadIDParam';
+import { API_BASE } from '../lib/config';
 
 // Re-export types for consumers
 export type { Thread, Message, ActiveStep, ThreadContextType, MessageVersion, MessageMetadata, CustomPersona };
 
-const API_BASE = 'http://localhost:8000';
+// Maps backend tool/agent names to the ResearchPhase keys expected by DeepResearchProgress
+const getPhaseFromToolName = (toolName: string): string => {
+    const name = toolName.toLowerCase();
+
+    if (name.includes('websearch') || name.includes('internet_search') || name.includes('search') || name.includes('arxiv')) {
+        return 'searching';
+    } else if (name.includes('draft')) {
+        return 'drafting';
+    } else if (name.includes('reasoning') || name.includes('fact_check') || name.includes('verify') || name.includes('validate')) {
+        return 'reasoning';
+    } else if (name.includes('report') || name.includes('export') || name.includes('pdf') || name.includes('docx') || name.includes('finalize') || name.includes('summary')) {
+        return 'finalizing';
+    }
+
+    return 'searching'; // Default to searching if we are running tools
+};
+
+// Helper to calculate a rough progress percentage based on phase
+const getProgressFromPhase = (phase: string): number => {
+    const phases = ['planning', 'searching', 'drafting', 'reasoning', 'finalizing'];
+    const index = phases.indexOf(phase);
+    // Map to dots: 0% (planning), 25% (searching), 50% (drafting), 75% (reasoning), 100% (finalizing)
+    return index >= 0 ? Math.min(index * 25, 100) : 10;
+};
+
+// --- Helper Functions Moved to Top Level for Reuse ---
+
+// Helper to parse download markers from content - relaxed parsing
+const parseDownloadContent = (content: string): { cleanContent: string; download?: { filename: string; data: string } } => {
+    // Check for both markers
+    const pdfMarker = '[DOWNLOAD_PDF]';
+    const docxMarker = '[DOWNLOAD_DOCX]';
+
+    let marker = null;
+    if (content.includes(pdfMarker)) marker = pdfMarker;
+    else if (content.includes(docxMarker)) marker = docxMarker;
+
+    if (marker) {
+        const index = content.indexOf(marker);
+
+        try {
+            // Extract potential JSON part (everything after marker)
+            const jsonPart = content.substring(index + marker.length).trim();
+
+            // Use brace counting to find complete JSON object
+            let braceCount = 0;
+            let jsonEndIndex = -1;
+            for (let i = 0; i < jsonPart.length; i++) {
+                if (jsonPart[i] === '{') braceCount++;
+                else if (jsonPart[i] === '}') {
+                    braceCount--;
+                    if (braceCount === 0) {
+                        jsonEndIndex = i;
+                        break;
+                    }
+                }
+            }
+
+            if (jsonEndIndex !== -1) {
+                const jsonStr = jsonPart.substring(0, jsonEndIndex + 1);
+                const download = JSON.parse(jsonStr);
+
+                // Add the implied extension from the marker if not present
+                if (download && !download.type) {
+                    download.type = marker === '[DOWNLOAD_PDF]' ? 'pdf' : 'docx';
+                }
+
+                // Clean content by removing the marker and JSON
+                const cleanContent = content.substring(0, index).trim() || 'Report generated successfully! Click below to download.';
+                return { cleanContent, download };
+            }
+        } catch (e) {
+            console.error('❌ Failed to parse download data JSON:', e);
+        }
+    }
+
+    return { cleanContent: content };
+};
+
+// Helper to parse verification markers from content
+const parseVerificationContent = (content: string): { cleanContent: string; verification?: VerificationData } => {
+    const verificationMarker = '[VERIFICATION]';
+
+    if (content.includes(verificationMarker)) {
+        const index = content.indexOf(verificationMarker);
+
+        try {
+            const jsonPart = content.substring(index + verificationMarker.length).trim();
+
+            // Use brace counting to find complete JSON object
+            let braceCount = 0;
+            let jsonEndIndex = -1;
+            for (let i = 0; i < jsonPart.length; i++) {
+                if (jsonPart[i] === '{') braceCount++;
+                else if (jsonPart[i] === '}') {
+                    braceCount--;
+                    if (braceCount === 0) {
+                        jsonEndIndex = i;
+                        break;
+                    }
+                }
+            }
+
+            if (jsonEndIndex !== -1) {
+                const jsonStr = jsonPart.substring(0, jsonEndIndex + 1);
+                const verification = JSON.parse(jsonStr) as VerificationData;
+                const cleanContent = content.substring(0, index).trim();
+                return { cleanContent, verification };
+            }
+        } catch (e) {
+            console.warn('Failed to parse verification data JSON:', e);
+        }
+    }
+
+    return { cleanContent: content };
+};
+
+// Helper to determine verification status from tool calls
+const getVerificationStatus = (toolNames: string[]): string => {
+    const verificationTools = ['validate_citations', 'fact_check_claims', 'assess_content_quality', 'cross_reference_sources', 'verify_draft_completeness'];
+    const activeVerification = toolNames.find(name => verificationTools.includes(name));
+
+    if (activeVerification) {
+        switch (activeVerification) {
+            case 'validate_citations': return '🔗 Validating citations...';
+            case 'fact_check_claims': return '✓ Fact-checking claims...';
+            case 'assess_content_quality': return '📊 Assessing quality...';
+            case 'cross_reference_sources': return '🔄 Cross-referencing sources...';
+            case 'verify_draft_completeness': return '📝 Verifying completeness...';
+            default: return `🔍 ${activeVerification}`;
+        }
+    }
+    return `🔍 Researching... (${toolNames.join(', ')})`;
+};
 
 // Helper function to format messages from backend
 const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
-    // Debug: Log raw messages from backend
-    console.log('🔍 RAW messages from backend:', messages.length);
-    messages.forEach((msg, idx) => {
-        const rawContent = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-        const hasEditMeta = rawContent.includes('EDIT_META');
-        console.log(`  RAW[${idx}] type=${msg.type} role=${msg.role} hasEditMeta=${hasEditMeta} content=${rawContent.substring(0, 100)}...`);
-    });
 
     // First pass: convert all messages to Message format
     const allMessages: Message[] = messages.map((msg) => {
@@ -90,51 +216,28 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
             .replace(/\[EDIT_META:\{.*?\}\]/g, '')
             .trim();
 
-        let downloadData;
-        const pdfMarker = '[DOWNLOAD_PDF]';
-        const docxMarker = '[DOWNLOAD_DOCX]';
+        // Parse verification data from content
+        const verificationParsed = parseVerificationContent(content);
+        content = verificationParsed.cleanContent;
+        const verificationData = verificationParsed.verification;
 
-        let marker = null;
-        if (content.includes(pdfMarker)) marker = pdfMarker;
-        else if (content.includes(docxMarker)) marker = docxMarker;
+        // Parse download data from content
+        const downloadParsed = parseDownloadContent(content);
+        content = downloadParsed.cleanContent;
+        const downloadData = downloadParsed.download;
 
-        if (marker) {
-            try {
-                const index = content.indexOf(marker);
-                const jsonPart = content.substring(index + marker.length).trim();
-
-                // Use brace counting to find complete JSON
-                let braceCount = 0;
-                let jsonEndIndex = -1;
-                for (let i = 0; i < jsonPart.length; i++) {
-                    if (jsonPart[i] === '{') braceCount++;
-                    else if (jsonPart[i] === '}') {
-                        braceCount--;
-                        if (braceCount === 0) {
-                            jsonEndIndex = i;
-                            break;
-                        }
-                    }
-                }
-
-                if (jsonEndIndex !== -1) {
-                    const jsonStr = jsonPart.substring(0, jsonEndIndex + 1);
-                    downloadData = JSON.parse(jsonStr);
-                    content = content.substring(0, index).trim() || 'Report generated successfully! Click below to download.';
-                }
-            } catch (e) {
-                console.warn('Failed to parse historical download:', e);
-            }
-        }
-
+        const msgAny = msg as any;
         return {
             role: isUser ? 'user' : 'agent',
             content: content,
-            download: downloadData,
+            download: downloadData || (msgAny.download && (msgAny.download.filename || msgAny.download.data) ? {
+                filename: msgAny.download.filename || '',
+                data: msgAny.download.data || ''
+            } : undefined),
+            verification: verificationData || (msgAny.verification as VerificationData),
             attachments: attachments,
-            checkpoint_id: (msg as any).checkpoint_id,
-            parent_checkpoint_id: (msg as any).parent_checkpoint_id,
-            // Edit versioning metadata extracted from [EDIT_META:...] in content
+            checkpoint_id: msgAny.checkpoint_id,
+            parent_checkpoint_id: msgAny.parent_checkpoint_id,
             editGroupId: editGroupId,
             currentVersionIndex: editVersion,
             isEdit: isEdit,
@@ -142,11 +245,6 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
         } as Message;
     }).filter((msg): msg is Message => msg !== null);
 
-    // Debug: Log what we received from backend
-    console.log('📥 formatMessagesFromBackend received:', allMessages.length, 'messages');
-    allMessages.forEach((msg, idx) => {
-        console.log(`  [${idx}] ${msg.role}: "${msg.content.substring(0, 50)}..." isEdit=${msg.isEdit}, origIdx=${msg.originalMessageIndex}, editGroup=${msg.editGroupId}`);
-    });
 
     // Second pass: Identify which messages are edits and group them
     // Strategy: Messages with isEdit=true should REPLACE original messages
@@ -181,7 +279,7 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
     });
 
     // Also mark original user messages and their agent responses as skipped if they have edits
-    editsByUserMsgNum.forEach((edits, userMsgNum) => {
+    editsByUserMsgNum.forEach((_, userMsgNum) => {
         if (userMsgNum < userMessageIndices.length) {
             const origUserIdx = userMessageIndices[userMsgNum];
             // Mark original agent response (follows original user) as skipped
@@ -285,7 +383,7 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
     });
 
     // Final pass: merge consecutive agent messages for downloads
-    const mergedMessages = formattedMessages.reduce((acc: Message[], msg) => {
+    return formattedMessages.reduce((acc: Message[], msg) => {
         if (msg.role === 'agent') {
             const prevMsg = acc[acc.length - 1];
 
@@ -310,16 +408,7 @@ const formatMessagesFromBackend = (messages: BackendMessage[]): Message[] => {
         acc.push(msg);
         return acc;
     }, []);
-
-    if (mergedMessages.length === 0) {
-        mergedMessages.push({
-            role: 'agent',
-            content: "Hello! I am MAIRA, your advanced research agent. How can I help you today?"
-        });
-    }
-
-    return mergedMessages;
-};
+}
 
 interface ThreadProviderProps {
     children: ReactNode;
@@ -333,12 +422,11 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
     const [threads, setThreads] = useState<Thread[]>([]);
     // Don't restore from localStorage until we verify the thread belongs to the current user
     const [currentThreadId, setCurrentThreadId] = useState<string | null>(null);
-    const [currentMessages, setCurrentMessages] = useState<Message[]>([
-        { role: 'agent', content: "Hello! I am MAIRA, your advanced research agent. How can I help you today?" }
-    ]);
+    const [currentMessages, setCurrentMessages] = useState<Message[]>([]);
     const [checkpoints, setCheckpoints] = useState<CheckpointInfo[]>([]);
     const [isLoading, setIsLoading] = useState(false);
     const [isLoadingThreads, setIsLoadingThreads] = useState(false);
+    const [isLoadingMessages, setIsLoadingMessages] = useState(false);
     const [isReconnecting, setIsReconnecting] = useState(false); // Track reconnection status
     const [reconnectOnMount, setReconnectOnMount] = useState(true); // Control auto-reconnect behavior
 
@@ -348,6 +436,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
     const [persona, setPersona] = useState<string>(() => {
         try { return localStorage.getItem('maira_persona') || 'default'; } catch { return 'default'; }
     });
+    const [isTimelineOpen, setIsTimelineOpen] = useState(false);
     const [sites, setSites] = useState<string[]>(() => {
         try {
             const cached = localStorage.getItem('maira_sites');
@@ -383,8 +472,6 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
     const abortControllerRef = useRef<AbortController | null>(null);
     // Flag to prevent re-entrancy in thread selection
     const isSelectingRef = useRef(false);
-    // Track if initial mount reconnect check has been done
-    const hasCheckedReconnectRef = useRef(false);
 
     // Persist persona to localStorage
     useEffect(() => {
@@ -424,6 +511,20 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
             await loadCustomPersonas();
         } catch (error) {
             console.error('Failed to create custom persona:', error);
+            throw error;
+        }
+    }, [user?.id, loadCustomPersonas]);
+
+    const updateCustomPersona = useCallback(async (personaId: string, name: string, instructions: string) => {
+        if (!user?.id) return;
+        try {
+            await axios.put(`${API_BASE}/personas/${personaId}?user_id=${user.id}`, {
+                name,
+                instructions
+            });
+            await loadCustomPersonas();
+        } catch (error) {
+            console.error('Failed to update custom persona:', error);
             throw error;
         }
     }, [user?.id, loadCustomPersonas]);
@@ -499,9 +600,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
             console.log('👤 User changed, clearing thread state');
             setCurrentThreadId(null);
             setThreads([]);
-            setCurrentMessages([
-                { role: 'agent', content: "Hello! I am MAIRA, your advanced research agent. How can I help you today?" }
-            ]);
+            setCurrentMessages([]);
             localStorage.removeItem('maira_current_thread_id');
         }
         prevUserIdRef.current = user?.id ?? null;
@@ -556,6 +655,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
 
         isSelectingRef.current = true;
         setCurrentThreadId(threadId);
+        setIsLoadingMessages(true);
         setIsLoading(true);
 
         try {
@@ -563,33 +663,53 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
             const messages = response.data.messages || [];
             const formattedMessages = formatMessagesFromBackend(messages);
 
-            // Check if any messages have download markers but no data (history reload).
-            // If so, fetch the actual file data from Supabase Storage.
-            const needsDownloadData = formattedMessages.some(
-                (m) => m.download && !m.download.data
-            );
-            if (needsDownloadData) {
+            // Always attempt to restore downloads from Supabase for threads that have
+            // agent messages. The checkpoint messages have their [DOWNLOAD_PDF] markers
+            // stripped during serialisation so we cannot rely on msg.download being set
+            // from content; the backend will inject a stub but we always fetch to be safe.
+            const hasAgentMessages = formattedMessages.some(m => m.role === 'agent');
+            if (hasAgentMessages) {
                 try {
                     const dlResp = await axios.get(`${API_BASE}/threads/${threadId}/downloads`);
                     const downloads: { filename: string; data: string; file_type: string }[] =
                         dlResp.data.downloads || [];
+
                     if (downloads.length > 0) {
-                        console.log(`☁️ Restored ${downloads.length} download(s) from Supabase`);
+                        // Sort by filename descending (latest first) to ensure we pick newest versions
+                        downloads.sort((a, b) => b.filename.localeCompare(a.filename));
+
+                        // Pass 1: Match by filename against messages that already have a download stub
                         for (const msg of formattedMessages) {
                             if (msg.download && !msg.download.data) {
-                                // Match by filename (strip extensions for fuzzy match)
-                                const match = downloads.find(
-                                    (d) =>
-                                        d.filename === msg.download!.filename ||
-                                        d.filename.replace(/\.\w+$/, '') ===
-                                        msg.download!.filename.replace(/\.\w+$/, '')
-                                );
+                                // Try to find a match that honors the expected file type if available
+                                const expectedExt = (msg.download as any).type || (msg.download.filename.toLowerCase().endsWith('.pdf') ? 'pdf' : 'docx');
+
+                                const match = downloads.find((d) => {
+                                    const isExactMatch = d.filename === msg.download!.filename;
+                                    const isBaseMatch = d.filename.replace(/\.\w+$/, '') === msg.download!.filename.replace(/\.\w+$/, '');
+                                    const extensionMatches = d.filename.toLowerCase().endsWith(`.${expectedExt}`) ||
+                                        (d as any).file_type === expectedExt;
+
+                                    return isExactMatch || (isBaseMatch && extensionMatches);
+                                });
+
                                 if (match) {
-                                    msg.download = {
-                                        filename: match.filename,
-                                        data: match.data,
-                                    };
+                                    msg.download = { filename: match.filename, data: match.data };
                                 }
+                            }
+                        }
+
+                        // Pass 2: Fallback for messages with NO stubs at all (backend stripped them)
+                        const hasAnyDownloadWithData = formattedMessages.some(m => m.download?.data);
+                        if (!hasAnyDownloadWithData) {
+                            // If NO message got a match, try to find the absolute most recent download 
+                            // and attach it to the LAST agent message as a final fallback
+                            const lastAgentMsg = [...formattedMessages].reverse().find(m => m.role === 'agent');
+                            if (lastAgentMsg && downloads[0]) {
+                                lastAgentMsg.download = {
+                                    filename: downloads[0].filename,
+                                    data: downloads[0].data
+                                };
                             }
                         }
                     }
@@ -601,11 +721,10 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
             setCurrentMessages(formattedMessages);
         } catch (error) {
             console.error('Failed to load thread messages:', error);
-            setCurrentMessages([
-                { role: 'agent', content: "Hello! I am MAIRA, your advanced research agent. How can I help you today?" }
-            ]);
+            setCurrentMessages([]);
         } finally {
             setIsLoading(false);
+            setIsLoadingMessages(false);
             isSelectingRef.current = false;
         }
     }, []);
@@ -617,6 +736,32 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
 
         try {
             console.log('🔄 Attempting to reconnect to stream for thread:', threadId);
+
+            // 1. First check session status to determine if deep research is active
+            try {
+                const statusResp = await fetch(`${API_BASE}/sessions/${threadId}/status`);
+                if (statusResp.ok) {
+                    const sessionStatus = await statusResp.json();
+                    console.log('📊 Session status:', sessionStatus);
+
+                    if (sessionStatus.has_active_stream && sessionStatus.deep_research) {
+                        console.log('🔬 Deep research session detected, enabling toggle');
+                        setDeepResearch_internal(true);
+                    }
+
+                    // If session isn't running, no need to reconnect
+                    if (!sessionStatus.has_active_stream) {
+                        console.log('ℹ️ Session is not running, skipping reconnect');
+                        setIsReconnecting(false);
+                        setIsLoading(false);
+                        return;
+                    }
+                }
+            } catch (statusErr) {
+                console.warn('⚠️ Could not check session status:', statusErr);
+            }
+
+            // 2. Connect to the SSE stream
             const response = await fetch(`${API_BASE}/sessions/${threadId}/stream?from_index=0`);
 
             if (!response.ok) {
@@ -631,6 +776,11 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
             const decoder = new TextDecoder();
             let buffer = '';
             let accumulatedContent = '';
+
+            // Phase ordering for anti-regression during reconnect
+            const PHASE_ORDER: Record<string, number> = { planning: 0, searching: 1, drafting: 2, reasoning: 3, finalizing: 4, completed: 5 };
+            let highestPhase = '';
+            let highestPhaseIdx = -1;
 
             if (!reader) {
                 throw new Error('No response body reader available');
@@ -685,37 +835,109 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
 
                             if (data.type === 'ping') continue;
 
+                            // Handle init events — detect deep research mode
+                            if (data.type === 'init') {
+                                if (data.deep_research) {
+                                    console.log('🔬 Reconnect: init event confirms deep research mode');
+                                    setDeepResearch_internal(true);
+                                }
+                                // Set mode on streaming message
+                                setCurrentMessages(prev => {
+                                    const updated = [...prev];
+                                    const lastIdx = updated.length - 1;
+                                    if (updated[lastIdx]?.type === 'streaming') {
+                                        updated[lastIdx] = {
+                                            ...updated[lastIdx],
+                                            mode: data.mode,
+                                            modeDisplay: data.mode_display
+                                        };
+                                    }
+                                    return updated;
+                                });
+                                continue;
+                            }
+
+                            // Handle phase events — update currentPhase on streaming message
+                            if (data.type === 'phase') {
+                                const { phase, name, icon, description } = data;
+                                const phaseIdx = PHASE_ORDER[phase] ?? -1;
+
+                                // Anti-regression: only advance forward
+                                if (phaseIdx > highestPhaseIdx) {
+                                    highestPhase = phase;
+                                    highestPhaseIdx = phaseIdx;
+                                }
+
+
+
+                                setCurrentMessages(prev => {
+                                    const updated = [...prev];
+                                    const lastIdx = updated.length - 1;
+                                    if (updated[lastIdx]?.type === 'streaming') {
+                                        updated[lastIdx] = {
+                                            ...updated[lastIdx],
+                                            currentPhase: highestPhase,
+                                            phaseName: name,
+                                            phaseIcon: icon,
+                                            phaseDescription: description
+                                        };
+                                    }
+                                    return updated;
+                                });
+                                continue;
+                            }
+
                             // Handle real-time status updates (Sync with sendMessage logic)
                             if (data.type === 'status') {
-                                const { tool, step, message } = data;
+                                const { tool, step, message, detail, icon, phase, progress: statusProgress } = data;
                                 if (tool) {
                                     // Update active steps for UI tracking
+                                    const activePhase = getPhaseFromToolName(tool);
+                                    const calculatedProgress = getProgressFromPhase(activePhase);
+
                                     setActiveSteps(prev => ({
                                         ...prev,
                                         [tool]: {
-                                            tool,
-                                            message: message || tool,
-                                            status: step === 'start' ? 'loading' : 'done',
+                                            id: tool,
+                                            action: message || `Running ${tool}...`,
+                                            status: step === 'start' ? 'running' : 'done',
+                                            detail: detail || `Agent is actively working on ${tool}`,
+                                            phase: activePhase,
+                                            progress: calculatedProgress,
                                             timestamp: Date.now()
                                         }
                                     }));
 
-                                    // Update streaming message status text
-                                    if (step === 'start') {
-                                        setCurrentMessages(prev => {
-                                            const updated = [...prev];
-                                            const lastIdx = updated.length - 1;
-
-                                            // Verify the last message is the one we are streaming
-                                            if (updated[lastIdx]?.type === 'streaming') {
-                                                updated[lastIdx] = {
-                                                    ...updated[lastIdx],
-                                                    status: message || `Running ${tool}...`,
-                                                };
-                                            }
-                                            return updated;
-                                        });
+                                    // Track phase from status events too (anti-regression)
+                                    const explicitPhase = phase || activePhase;
+                                    if (explicitPhase) {
+                                        const phaseIdx = PHASE_ORDER[explicitPhase] ?? -1;
+                                        if (phaseIdx > highestPhaseIdx) {
+                                            highestPhase = explicitPhase;
+                                            highestPhaseIdx = phaseIdx;
+                                        }
                                     }
+
+                                    setCurrentMessages(prev => {
+                                        const updated = [...prev];
+                                        const lastIdx = updated.length - 1;
+
+                                        // Verify the last message is the one we are streaming
+                                        if (updated[lastIdx]?.type === 'streaming') {
+                                            const statusText = message || `Running ${tool}...`;
+                                            updated[lastIdx] = {
+                                                ...updated[lastIdx],
+                                                status: statusText,
+                                                statusDetail: detail,
+                                                statusIcon: icon,
+                                                currentPhase: highestPhase || updated[lastIdx].currentPhase,
+                                                progress: statusProgress ?? (step === 'start' ? calculatedProgress : updated[lastIdx].progress),
+                                                holdPhase: step === 'start' ? true : (updated[lastIdx].holdPhase || false),
+                                                holdValue: step === 'start' ? calculatedProgress : updated[lastIdx].holdValue
+                                            };
+                                        }
+                                        return updated;
+                                    });
                                 }
                                 continue;
                             }
@@ -744,7 +966,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
 
                             if (data.type === 'update' && data.messages) {
                                 // Only process the LAST message in the update to avoid duplicating history
-                                const messages = data.messages;
+                                const { messages } = data;
                                 if (messages.length > 0) {
                                     const msg = messages[messages.length - 1];
 
@@ -934,9 +1156,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
             // If deleted thread was current, reset to new chat
             if (currentThreadId === threadId) {
                 setCurrentThreadId(null);
-                setCurrentMessages([
-                    { role: 'agent', content: "Hello! I am MAIRA, your advanced research agent. How can I help you today?" }
-                ]);
+                setCurrentMessages([]);
                 localStorage.removeItem('maira_current_thread_id');
                 navigate('/chat', { replace: true });
             }
@@ -953,9 +1173,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         setDeepResearch_internal(false);
         setLiteratureSurvey_internal(false);
         setLastEventId(null);
-        setCurrentMessages([
-            { role: 'agent', content: "Hello! I am MAIRA, your advanced research agent. How can I help you today?" }
-        ]);
+        setCurrentMessages([]);
         localStorage.removeItem('maira_current_thread_id');
         navigate('/chat', { replace: true });
     }, [navigate]);
@@ -982,16 +1200,21 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
 
         setIsLoading(false);
 
-        // Update the last message to indicate interruption if it was streaming
+        // Finalize the last streaming message cleanly — preserve whatever reasoning arrived
         setCurrentMessages(prev => {
             const updated = [...prev];
             const lastIdx = updated.length - 1;
             if (lastIdx >= 0 && updated[lastIdx]?.type === 'streaming') {
+                const m = updated[lastIdx];
                 updated[lastIdx] = {
-                    ...updated[lastIdx],
-                    type: 'final',
-                    status: 'Stopped by user',
-                    content: updated[lastIdx].content + "\n\n(Generation stopped by user)"
+                    ...m,
+                    type: undefined,       // Remove streaming flag so ReasoningBlock exits streaming mode
+                    status: undefined,     // Clear spinner
+                    // Preserve whatever reasoning was already accumulated — don't wipe it
+                    reasoning: m.reasoning || undefined,
+                    content: m.content
+                        ? m.content + '\n\n*(Generation stopped by user)*'
+                        : '*(Generation stopped by user)*'
                 };
             }
             return updated;
@@ -1001,7 +1224,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
     }, [currentThreadId]);
 
     // Send a message with SSE streaming
-    const sendMessage = useCallback(async (prompt: string, parentCheckpointId?: string, attachments?: { name: string; type: 'file' | 'image' }[]) => {
+    const sendMessage = useCallback(async (prompt: string, parentCheckpointId?: string, attachments?: { name: string; type: 'file' | 'image' }[], skipMessageAdd = false) => {
         if (!prompt.trim() || isLoading) return;
 
         // Require user to be logged in for new threads
@@ -1025,23 +1248,24 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
             const fileList = attachments.map(a => a.name).join(', ');
             agentPrompt = `[UPLOADED_FILES: ${fileList}]\n${prompt}`;
         }
-        // Sites are sent via the request body 'sites' field — no need to prefix the prompt
 
         // Add user message immediately and finalize any interrupted streaming messages
-        setCurrentMessages(prev => {
-            const sanitized = prev.map(m => {
-                if (m.type === 'streaming') {
-                    return {
-                        ...m,
-                        type: undefined, // Remove streaming type
-                        status: 'Interrupted',
-                        content: m.content ? m.content + "\n\n(Interrupted)" : "(Interrupted)"
-                    };
-                }
-                return m;
+        if (!skipMessageAdd) {
+            setCurrentMessages(prev => {
+                const sanitized = prev.map(m => {
+                    if (m.type === 'streaming') {
+                        return {
+                            ...m,
+                            type: undefined, // Remove streaming type
+                            status: 'Interrupted',
+                            content: m.content ? m.content + "\n\n(Interrupted)" : "(Interrupted)"
+                        };
+                    }
+                    return m;
+                });
+                return [...sanitized, { role: 'user', content: prompt, attachments }];
             });
-            return [...sanitized, { role: 'user', content: prompt, attachments }];
-        });
+        }
         setIsLoading(true);
 
         let newThreadId = currentThreadId;
@@ -1058,112 +1282,6 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         const streamingSessionId = `stream_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
 
-        // Helper to parse download markers from content - relaxed parsing
-        const parseDownloadContent = (content: string): { cleanContent: string; download?: { filename: string; data: string } } => {
-            // Check for both markers
-            const pdfMarker = '[DOWNLOAD_PDF]';
-            const docxMarker = '[DOWNLOAD_DOCX]';
-
-            let marker = null;
-            if (content.includes(pdfMarker)) marker = pdfMarker;
-            else if (content.includes(docxMarker)) marker = docxMarker;
-
-            if (marker) {
-                const index = content.indexOf(marker);
-
-                try {
-                    // Extract potential JSON part (everything after marker)
-                    const jsonPart = content.substring(index + marker.length).trim();
-
-                    // Use brace counting to find complete JSON object
-                    let braceCount = 0;
-                    let jsonEndIndex = -1;
-                    for (let i = 0; i < jsonPart.length; i++) {
-                        if (jsonPart[i] === '{') braceCount++;
-                        else if (jsonPart[i] === '}') {
-                            braceCount--;
-                            if (braceCount === 0) {
-                                jsonEndIndex = i;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (jsonEndIndex !== -1) {
-                        const jsonStr = jsonPart.substring(0, jsonEndIndex + 1);
-                        const download = JSON.parse(jsonStr);
-
-                        // Clean content by removing the marker and JSON
-                        const cleanContent = content.substring(0, index).trim() || 'Report generated successfully! Click below to download.';
-                        console.log("✅ Download parsed successfully:", download.filename, "Data length:", download.data?.length);
-                        return { cleanContent, download };
-                    }
-                } catch (e) {
-                    console.error('❌ Failed to parse download data JSON:', e);
-                }
-            }
-
-            return { cleanContent: content };
-        };
-
-        // Helper to parse verification markers from content
-        const parseVerificationContent = (content: string): { cleanContent: string; verification?: VerificationData } => {
-            const verificationMarker = '[VERIFICATION]';
-
-            if (content.includes(verificationMarker)) {
-                const index = content.indexOf(verificationMarker);
-
-                try {
-                    const jsonPart = content.substring(index + verificationMarker.length).trim();
-
-                    // Use brace counting to find complete JSON object
-                    let braceCount = 0;
-                    let jsonEndIndex = -1;
-                    for (let i = 0; i < jsonPart.length; i++) {
-                        if (jsonPart[i] === '{') braceCount++;
-                        else if (jsonPart[i] === '}') {
-                            braceCount--;
-                            if (braceCount === 0) {
-                                jsonEndIndex = i;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (jsonEndIndex !== -1) {
-                        const jsonStr = jsonPart.substring(0, jsonEndIndex + 1);
-                        const verification = JSON.parse(jsonStr) as VerificationData;
-                        const cleanContent = content.substring(0, index).trim();
-                        console.log("✅ Verification parsed:", verification.status, verification.overallScore);
-                        return { cleanContent, verification };
-                    }
-                } catch (e) {
-                    console.warn('Failed to parse verification data JSON:', e);
-                }
-            }
-
-            return { cleanContent: content };
-        };
-
-
-
-        // Helper to determine verification status from tool calls
-        const getVerificationStatus = (toolNames: string[]): string => {
-            const verificationTools = ['validate_citations', 'fact_check_claims', 'assess_content_quality', 'cross_reference_sources', 'verify_draft_completeness'];
-            const activeVerification = toolNames.find(name => verificationTools.includes(name));
-
-            if (activeVerification) {
-                switch (activeVerification) {
-                    case 'validate_citations': return '🔗 Validating citations...';
-                    case 'fact_check_claims': return '✓ Fact-checking claims...';
-                    case 'assess_content_quality': return '📊 Assessing quality...';
-                    case 'cross_reference_sources': return '🔄 Cross-referencing sources...';
-                    case 'verify_draft_completeness': return '📝 Verifying completeness...';
-                    default: return `🔍 ${activeVerification}`;
-                }
-            }
-            return `🔍 Researching... (${toolNames.join(', ')})`;
-        };
 
         // Reconnection logic
         const connectStream = async (retryCount = 0): Promise<void> => {
@@ -1177,15 +1295,6 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                     persona: persona, // Pass selected persona
                     sites: ((deepResearch || literatureSurvey) && isSiteRestrictionEnabled && sites.length > 0) ? sites : undefined, // Only pass sites if enabled and non-empty
                 };
-                // Debug logging
-                console.log('🚀 Sending request to backend:');
-                console.log('   👤 User ID:', user?.id);
-                console.log('   📋 Persona:', persona);
-                console.log('   🔍 Deep Research:', deepResearch);
-                console.log('   📚 Literature Survey:', literatureSurvey);
-                console.log('   📦 Full request body:', requestBody);
-
-                // For branching: include parent checkpoint ID
                 if (parentCheckpointId) {
                     requestBody.parent_checkpoint_id = parentCheckpointId;
                 }
@@ -1220,8 +1329,11 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                     setCurrentMessages(prev => [...prev, {
                         role: 'agent',
                         content: '',
-                        status: 'Thinking...',
+                        // Fix for UI jumping to "Reasoning" phase due to "Thinking..." status match
+                        status: deepResearch ? 'Planning Strategy...' : 'Thinking...',
+                        progress: 0,
                         type: 'streaming',
+                        currentPhase: deepResearch ? 'planning' : undefined,
                         reasoning: undefined,
                         message_id: streamingSessionId  // Unique ID for this streaming session
                     }]);
@@ -1242,8 +1354,6 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                         if (line.startsWith('data: ')) {
                             try {
                                 const data = JSON.parse(line.slice(6));
-                                console.log('SSE data:', data); // Debug log
-
                                 // Skip ping events (keepalive)
                                 if (data.type === 'ping') continue;
 
@@ -1254,7 +1364,6 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
 
                                 // Handle already_running status (session reconnect)
                                 if (data.status === 'already_running') {
-                                    console.log('Session already running, subscribing to existing stream');
                                     // The backend will stream from the existing task
                                     continue;
                                 }
@@ -1266,38 +1375,144 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                                     }
                                     // Clear active steps on new conversation
                                     setActiveSteps({});
+
+                                    // Store mode info from init event for deep research UI
+                                    if (data.mode) {
+                                        setCurrentMessages(prev => {
+                                            const updated = [...prev];
+                                            const streamingIdx = updated.findIndex(m => m.message_id === streamingSessionId && m.type === 'streaming');
+                                            if (streamingIdx !== -1) {
+                                                updated[streamingIdx] = {
+                                                    ...updated[streamingIdx],
+                                                    mode: data.mode,
+                                                    modeDisplay: data.mode_display
+                                                };
+                                            }
+                                            return updated;
+                                        });
+                                    }
+                                } else if (data.type === 'phase') {
+                                    // Handle phase transitions from backend (deep research phases)
+                                    const { phase, name, icon, description } = data;
+                                    // Phase ordering for anti-regression
+                                    const PHASE_ORDER: Record<string, number> = { planning: 0, searching: 1, analyzing: 2, drafting: 3, reasoning: 4, finalizing: 5 };
+
+                                    setCurrentMessages(prev => {
+                                        const updated = [...prev];
+                                        const streamingIdx = updated.findIndex(m => m.message_id === streamingSessionId && m.type === 'streaming');
+                                        if (streamingIdx !== -1) {
+                                            // Anti-regression: only advance phase forward
+                                            const currentIdx = PHASE_ORDER[updated[streamingIdx].currentPhase as string] ?? -1;
+                                            const newIdx = PHASE_ORDER[phase] ?? -1;
+                                            if (newIdx >= currentIdx) {
+                                                updated[streamingIdx] = {
+                                                    ...updated[streamingIdx],
+                                                    currentPhase: phase,
+                                                    phaseName: name,
+                                                    phaseIcon: icon,
+                                                    phaseDescription: description
+                                                };
+                                            }
+                                        }
+                                        return updated;
+                                    });
+                                } else if (data.type === 'thinking') {
+                                    // Handle thinking/reasoning blocks from backend
+                                    const thinkingContent = data.content || '';
+                                    if (thinkingContent) {
+                                        accumulatedReasoning += thinkingContent;
+                                        hasReceivedReasoning = true;
+                                    }
+
+                                    setCurrentMessages(prev => {
+                                        const updated = [...prev];
+                                        const streamingIdx = updated.findIndex(m => m.message_id === streamingSessionId && m.type === 'streaming');
+                                        if (streamingIdx !== -1) {
+                                            const msg = updated[streamingIdx];
+                                            const PHASE_ORDER: Record<string, number> = { planning: 0, searching: 1, drafting: 2, reasoning: 3, finalizing: 4, completed: 5 };
+
+                                            // Anti-regression for phase: don't let a thinking event move us backwards
+                                            const newPhase = data.phase || msg.currentPhase;
+                                            const safePhase = (newPhase && msg.currentPhase)
+                                                ? (PHASE_ORDER[newPhase as string] ?? -1) >= (PHASE_ORDER[msg.currentPhase as string] ?? -1)
+                                                    ? newPhase
+                                                    : msg.currentPhase
+                                                : (newPhase || msg.currentPhase);
+
+                                            // Determine updated status: preserve specific research status messages
+                                            const currentStatus = msg.status || '';
+                                            const isGenericStatus = currentStatus === 'Thinking...' || currentStatus === '💭 Thinking...' || currentStatus.includes('Strategy...');
+                                            const newStatus = (deepResearch && !isGenericStatus) ? currentStatus : '💭 Thinking...';
+
+                                            updated[streamingIdx] = {
+                                                ...msg,
+                                                reasoning: hasReceivedReasoning ? accumulatedReasoning : undefined,
+                                                status: newStatus,
+                                                currentPhase: safePhase as any
+                                            };
+                                        }
+                                        return updated;
+                                    });
                                 } else if (data.type === 'status') {
                                     // Handle real-time status updates for tools/subagents
-                                    const { tool, step, message, progress } = data;
+                                    // Enhanced: now includes detail, icon, phase from backend
+                                    const { tool, step, message, progress, detail, icon, phase } = data;
                                     if (tool) {
+                                        const activePhase = getPhaseFromToolName(tool);
+                                        const calculatedProgress = getProgressFromPhase(activePhase);
+
                                         setActiveSteps(prev => ({
                                             ...prev,
                                             [tool]: {
-                                                tool,
-                                                message: message || tool,
-                                                status: step === 'start' ? 'loading' : 'done',
+                                                id: tool,
+                                                action: message || `Running ${tool}...`,
+                                                status: step === 'start' ? 'running' : 'done',
+                                                detail: detail || `Agent is actively working on ${tool}`,
+                                                phase: activePhase,
+                                                progress: calculatedProgress,
                                                 timestamp: Date.now()
                                             }
                                         }));
 
-                                        // Update streaming message status with current tool
-                                        if (step === 'start') {
-                                            setCurrentMessages(prev => {
-                                                const updated = [...prev];
-                                                const streamingIdx = updated.findIndex(m => m.message_id === streamingSessionId && m.type === 'streaming');
-                                                if (streamingIdx !== -1) {
-                                                    // Only update status, keep reasoning from current session only
-                                                    updated[streamingIdx] = {
-                                                        ...updated[streamingIdx],
-                                                        status: message || `Running ${tool}...`,
-                                                        progress: progress,
-                                                        // Ensure reasoning is only from current session
-                                                        reasoning: hasReceivedReasoning ? accumulatedReasoning : undefined
-                                                    };
-                                                }
-                                                return updated;
-                                            });
-                                        }
+                                        setCurrentMessages(prev => {
+                                            const updated = [...prev];
+                                            const streamingIdx = updated.findIndex(m => m.message_id === streamingSessionId && m.type === 'streaming');
+                                            if (streamingIdx === -1) return prev;
+
+                                            // Determine new status text
+                                            const statusText = message || `Running ${tool}...`;
+
+                                            // Anti-regression: only advance phase forward, never go back
+                                            const PHASE_ORDER: Record<string, number> = { planning: 0, searching: 1, analyzing: 2, drafting: 3, reasoning: 4, finalizing: 5 };
+                                            const existingPhase = updated[streamingIdx].currentPhase as string;
+
+                                            // Determine the best phase to apply
+                                            const phaseToApply = phase || activePhase;
+                                            const safePhase = phaseToApply
+                                                ? (PHASE_ORDER[phaseToApply] ?? -1) >= (PHASE_ORDER[existingPhase] ?? -1)
+                                                    ? phaseToApply
+                                                    : existingPhase
+                                                : existingPhase;
+
+                                            // Update the streaming message with enhanced status info from backend
+                                            updated[streamingIdx] = {
+                                                ...updated[streamingIdx],
+                                                status: statusText,
+                                                statusDetail: detail,  // Additional detail from backend
+                                                statusIcon: icon,      // Icon emoji from backend
+                                                // Update phase only if it moves forward
+                                                currentPhase: safePhase,
+                                                // Only set/override progress when a mapped phase indicates start
+                                                progress: (step === 'start') ? calculatedProgress : (progress || updated[streamingIdx].progress),
+                                                // hold the phase to prevent simulated progress from advancing past this phase
+                                                holdPhase: step === 'start' ? true : (updated[streamingIdx].holdPhase || false),
+                                                holdValue: step === 'start' ? calculatedProgress : updated[streamingIdx].holdValue,
+                                                // keep reasoning only if new reasoning arrived in this session
+                                                reasoning: hasReceivedReasoning ? accumulatedReasoning : undefined
+                                            };
+
+                                            return updated;
+                                        });
                                     }
                                 } else if (data.type === 'reasoning') {
                                     // Handle reasoning/thinking blocks separately
@@ -1321,7 +1536,6 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                                     });
                                 } else if (data.type === 'download') {
                                     // Handle download event directly from backend (bypasses LLM corruption)
-                                    console.log('📥 Download event received:', data.filename, 'Data length:', data.data?.length);
                                     if (data.filename && data.data) {
                                         downloadData = {
                                             filename: data.filename,
@@ -1343,8 +1557,6 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                                 } else if (data.type === 'update' && data.messages) {
                                     // Process messages from the update
                                     for (const msg of data.messages) {
-                                        console.log('Processing msg:', msg); // Debug log
-
                                         // Helper to extract content (handles array format from Gemini)
                                         const extractContent = (content: string | Array<{ text?: string }>): string => {
                                             if (typeof content === 'string') return content;
@@ -1436,15 +1648,17 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                                                     const streamingIdx = updated.findIndex(m => m.message_id === streamingSessionId && m.type === 'streaming');
                                                     if (streamingIdx !== -1) {
                                                         // Show content progressively, but keep streaming state until done
-                                                        // Preserve reasoning ONLY if we've received it this session, otherwise clear it
+                                                        // Preserve existing progress/hold flags from previous streaming state
+                                                        const prev = updated[streamingIdx];
                                                         updated[streamingIdx] = {
+                                                            ...prev,
                                                             role: 'agent',
                                                             message_id: streamingSessionId,
                                                             content: accumulatedContent || '',
-                                                            status: hasContent ? undefined : updated[streamingIdx].status, // Keep status if no real content yet
-                                                            reasoning: hasReceivedReasoning ? accumulatedReasoning : undefined, // Clear stale reasoning
-                                                            download: downloadData,
-                                                            verification: verificationData,
+                                                            status: hasContent ? undefined : prev.status, // Keep status if no real content yet
+                                                            reasoning: hasReceivedReasoning ? accumulatedReasoning : undefined, // Never inherit stale reasoning from the previous message
+                                                            download: downloadData || prev.download,
+                                                            verification: verificationData || prev.verification,
                                                             type: 'streaming' // Always stay streaming until done event
                                                         };
                                                     }
@@ -1453,7 +1667,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                                             }
                                         }
                                     }
-                                } else if (data.type === 'done') {
+                                } else if (data.type === 'done' || data.type === 'cancelled') {
                                     // Finalize the message and stop loading
                                     responseComplete = true;
                                     setIsLoading(false);
@@ -1461,31 +1675,34 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                                     // Clear active steps when done
                                     setActiveSteps({});
 
-                                    console.log("✅ Done event received. Content length:", accumulatedContent.length, "Has download:", !!downloadData);
+                                    const isCancelled = data.type === 'cancelled';
+                                    console.log(isCancelled ? '⛔ Cancelled event received' : '✅ Done event received', 'Content length:', accumulatedContent.length);
 
                                     setCurrentMessages(prev => {
                                         const updated = [...prev];
                                         const streamingIdx = updated.findIndex(m => m.message_id === streamingSessionId);
                                         if (streamingIdx !== -1 && updated[streamingIdx]?.role === 'agent') {
-                                            // Use accumulated content, or existing content, or fallback
                                             let finalContent = accumulatedContent || updated[streamingIdx].content;
 
-                                            // Only use placeholder if we have download but no real content
                                             if (!finalContent && (downloadData || updated[streamingIdx].download)) {
                                                 finalContent = 'Report generated successfully! Click below to download.';
+                                            } else if (!finalContent && isCancelled) {
+                                                finalContent = '*(Generation stopped)*';
                                             } else if (!finalContent) {
                                                 finalContent = "I couldn't generate a response.";
                                             }
 
                                             updated[streamingIdx] = {
                                                 ...updated[streamingIdx],
-                                                type: undefined, // Remove streaming type
+                                                type: undefined,    // Exit streaming mode — ReasoningBlock stops its timer
                                                 content: finalContent,
                                                 status: undefined,
-                                                // Only include reasoning if we actually received it this session
+                                                // Only carry reasoning if it actually arrived this session
                                                 reasoning: hasReceivedReasoning ? accumulatedReasoning : undefined,
                                                 download: downloadData || updated[streamingIdx].download,
-                                                verification: verificationData || updated[streamingIdx].verification
+                                                verification: verificationData || updated[streamingIdx].verification,
+                                                holdPhase: false,
+                                                holdValue: undefined
                                             };
                                         }
                                         return updated;
@@ -1525,7 +1742,9 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                                                 message_id: streamingSessionId,
                                                 content: `⚠️ An error occurred: ${data.error}\n\nPlease try again or rephrase your request.`,
                                                 type: undefined,
-                                                status: undefined
+                                                status: undefined,
+                                                holdPhase: false,
+                                                holdValue: undefined
                                             };
                                         }
                                         return updated;
@@ -1657,8 +1876,6 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
 
         // Build versions array
         const existingVersions = messageToEdit.versions || [];
-        const currentVersionIdx = messageToEdit.currentVersionIndex ?? (existingVersions.length > 0 ? existingVersions.length - 1 : 0);
-
         // If this is the first edit, save the original as version 0
         let versions: MessageVersion[] = [...existingVersions];
         if (versions.length === 0) {
@@ -1736,7 +1953,8 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         setIsLoading(true);
 
         let accumulatedContent = '';
-        let accumulatedReasoning = '';
+        let accumulatedReasoning = '';          // Reset per edit session — no stale bleed
+        let hasEditReasoning = false;            // Guard: only show reasoning that arrived THIS edit session
         let downloadData: { filename: string; data: string } | undefined = undefined;
         let verificationData: VerificationData | undefined = undefined;
 
@@ -1783,8 +2001,10 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                     try {
                         const event = JSON.parse(jsonStr);
 
-                        if (event.type === 'reasoning' && event.content) {
+                        // Handle both 'thinking' (live stream) and 'reasoning' (batch) events
+                        if ((event.type === 'thinking' || event.type === 'reasoning') && event.content) {
                             accumulatedReasoning += event.content;
+                            hasEditReasoning = true;
                         }
 
                         if (event.type === 'download' && event.filename && event.data) {
@@ -1823,7 +2043,8 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                                                 updated[agentIdx] = {
                                                     ...updated[agentIdx],
                                                     content: accumulatedContent,
-                                                    reasoning: accumulatedReasoning || undefined,
+                                                    // Never inherit reasoning from previous version — only show what arrived this edit
+                                                    reasoning: hasEditReasoning ? accumulatedReasoning : undefined,
                                                     type: 'streaming',
                                                     status: undefined
                                                 };
@@ -1840,7 +2061,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                             setCurrentMessages(prev => {
                                 const updated = [...prev];
                                 const userMsgIdx = updated.findIndex(
-                                    (m, i) => m.role === 'user' && m.editGroupId === editGroupId
+                                    (m) => m.role === 'user' && m.editGroupId === editGroupId
                                 );
                                 if (userMsgIdx !== -1 && updated[userMsgIdx].versions) {
                                     const versionsCopy = [...updated[userMsgIdx].versions!];
@@ -1849,7 +2070,8 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                                         versionsCopy[vIdx] = {
                                             ...versionsCopy[vIdx],
                                             agentContent: accumulatedContent,
-                                            agentReasoning: accumulatedReasoning || undefined,
+                                            // Only persist reasoning that actually arrived this edit session
+                                            agentReasoning: hasEditReasoning ? accumulatedReasoning : undefined,
                                             agentDownload: downloadData,
                                             agentVerification: verificationData
                                         };
@@ -1862,11 +2084,11 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
                                         updated[agentIdx] = {
                                             ...updated[agentIdx],
                                             content: accumulatedContent,
-                                            reasoning: accumulatedReasoning || undefined,
+                                            reasoning: hasEditReasoning ? accumulatedReasoning : undefined,
                                             download: downloadData,
                                             verification: verificationData,
                                             versions: versionsCopy,
-                                            type: 'final',
+                                            type: undefined,   // Exit streaming mode cleanly
                                             status: undefined
                                         };
                                     }
@@ -1967,6 +2189,61 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         };
     }, [currentMessages]);
 
+    // Retry a message - find the preceding user message and resend it
+    const retryMessage = useCallback(async (messageIndex: number) => {
+        if (isLoading) return;
+
+        const aiMessage = currentMessages[messageIndex];
+        if (!aiMessage || aiMessage.role !== 'agent') return;
+
+        // Find the preceding user message
+        const userMsgIndex = messageIndex - 1;
+        const userMessage = userMsgIndex >= 0 ? currentMessages[userMsgIndex] : null;
+
+        if (!userMessage || userMessage.role !== 'user') return;
+
+        // Remove the failed agent message and any subsequent messages (if any)
+        setCurrentMessages(prev => prev.slice(0, messageIndex));
+
+        // Call sendMessage with the original prompt, parent checkpoint, and any attachments
+        // Use skipMessageAdd=true because the user message is already in currentMessages
+        await sendMessage(userMessage.content, userMessage.parent_checkpoint_id, userMessage.attachments, true);
+    }, [currentMessages, isLoading, sendMessage]);
+
+    // Backend readiness check
+    const [isBackendReady, setIsBackendReady] = useState(false);
+
+    useEffect(() => {
+        let mounted = true;
+        let timeoutId: ReturnType<typeof setTimeout>;
+
+        const checkHealth = async () => {
+            try {
+                const res = await fetch(`${API_BASE}/health`);
+                if (mounted) {
+                    setIsBackendReady(res.ok);
+                }
+                // Periodic check every 10s if healthy, 2s if not
+                const delay = res.ok ? 10000 : 2000;
+                if (mounted) {
+                    timeoutId = setTimeout(checkHealth, delay);
+                }
+            } catch (e) {
+                if (mounted) {
+                    setIsBackendReady(false);
+                    timeoutId = setTimeout(checkHealth, 2000);
+                }
+            }
+        };
+
+        checkHealth();
+
+        return () => {
+            mounted = false;
+            if (timeoutId) clearTimeout(timeoutId);
+        };
+    }, []);
+
     const value = useMemo<ThreadContextType>(() => ({
         threads,
         currentThreadId,
@@ -1974,6 +2251,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         checkpoints,
         isLoading,
         isLoadingThreads,
+        isLoadingMessages,
         isReconnecting,
         reconnectOnMount,
         deepResearch,
@@ -2000,6 +2278,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         setIsSiteRestrictionEnabled,
         customPersonas,
         addCustomPersona,
+        updateCustomPersona,
         deleteCustomPersona,
         getCustomPersonaInstructions,
         loadSavedSites,
@@ -2009,8 +2288,12 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         fetchStateHistory,
         branchFromCheckpoint,
         stopStream,
+        retryMessage,
         uploadFile,
-        uploadImage
+        uploadImage,
+        isTimelineOpen,
+        setIsTimelineOpen,
+        isBackendReady
     }), [
         threads,
         currentThreadId,
@@ -2018,6 +2301,7 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         checkpoints,
         isLoading,
         isLoadingThreads,
+        isLoadingMessages,
         isReconnecting,
         reconnectOnMount,
         deepResearch,
@@ -2040,8 +2324,11 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         setLiteratureSurvey,
         setPersona,
         setSites,
+        isSiteRestrictionEnabled,
+        setIsSiteRestrictionEnabled,
         customPersonas,
         addCustomPersona,
+        updateCustomPersona,
         deleteCustomPersona,
         getCustomPersonaInstructions,
         loadSavedSites,
@@ -2051,9 +2338,11 @@ export const ThreadProvider = ({ children }: ThreadProviderProps) => {
         fetchStateHistory,
         branchFromCheckpoint,
         stopStream,
+        retryMessage,
         uploadFile,
         uploadImage,
-        isSiteRestrictionEnabled
+        isTimelineOpen,
+        isBackendReady
     ]);
 
     return (

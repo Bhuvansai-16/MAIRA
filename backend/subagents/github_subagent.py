@@ -25,7 +25,7 @@ from langchain_community.agent_toolkits.github.toolkit import GitHubToolkit
 from langchain_community.utilities.github import GitHubAPIWrapper
 from config import subagent_model
 from langchain.agents.middleware import ModelFallbackMiddleware, ModelRetryMiddleware
-from config import gemini_2_5_pro, claude_3_5_sonnet_aws
+from config import gemini_2_5_pro
 load_dotenv()
 
 # GitHub API base URL
@@ -48,7 +48,11 @@ def _parse_github_url(url: str) -> Optional[tuple]:
     # Strip ALL whitespace including newlines, tabs, etc.
     original_url = url
     url = re.sub(r'\s+', '', url)  # Remove ALL whitespace characters
-    url = url.strip().rstrip('/').rstrip('.git')
+    url = url.strip().rstrip('/')
+    
+    # Remove .git suffix cleanly (not using rstrip which strips characters individually)
+    if url.lower().endswith('.git'):
+        url = url[:-4]
     
     if url != original_url:
         print(f"🔍 Cleaned GitHub URL from: '{original_url}' -> '{url}'")
@@ -69,7 +73,14 @@ def _parse_github_url(url: str) -> Optional[tuple]:
         match = re.search(pattern, url)
         if match:
             owner = match.group(1).strip()
-            repo = match.group(2).strip().rstrip('.git').rstrip('.')
+            repo = match.group(2).strip()
+            
+            # Clean repo name - remove .git suffix if present after regex match
+            if repo.lower().endswith('.git'):
+                repo = repo[:-4]
+            # Remove trailing dots
+            repo = repo.rstrip('.')
+            
             print(f"✅ Parsed with {pattern_name}: owner='{owner}', repo='{repo}'")
             
             # Validate repo name (GitHub allows alphanumeric, hyphens, underscores, dots)
@@ -657,10 +668,9 @@ Note: For private repositories, the GitHub App must be installed with proper per
     "model": subagent_model,
     "middleware": [
         # Fallback specifically for this subagent
+        ModelRetryMiddleware(max_retries=2),
         ModelFallbackMiddleware(
             gemini_2_5_pro, # First fallback
-            claude_3_5_sonnet_aws       # Second fallback
         ),
-        ModelRetryMiddleware(max_retries=2)
     ]
 }

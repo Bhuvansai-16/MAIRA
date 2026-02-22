@@ -8,7 +8,7 @@ from tools.extracttool import extract_webpage
 from config import subagent_model
 from tools.latextoformate import convert_latex_to_pdf
 from langchain.agents.middleware import ModelFallbackMiddleware, ModelRetryMiddleware
-from config import gemini_2_5_pro, claude_3_5_sonnet_aws
+from config import gemini_2_5_pro
 literature_survey_subagent = {
     "name": "literature-survey-agent",
     "description": "Conducts comprehensive literature surveys by finding, analyzing, and comparing academic papers on a given topic. Produces structured literature reviews with paper summaries, comparison tables, research gaps, and references.",
@@ -127,10 +127,9 @@ The user receives the document directly — no additional explanation is needed.
     "model": subagent_model,
     "middleware": [
         # Fallback specifically for this subagent
+        ModelRetryMiddleware(max_retries=2),
         ModelFallbackMiddleware(
             gemini_2_5_pro, # First fallback
-            claude_3_5_sonnet_aws       # Second fallback
         ),
-        ModelRetryMiddleware(max_retries=2)
     ]
 }

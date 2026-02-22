@@ -23,7 +23,7 @@ export const useThreadIDParam = (options: UseThreadIDParamOptions = {}): UseThre
     // We prioritize path params over query params if both exist logic-wise, 
     // but React Router usually separates them.
     const threadId = params[paramName];
-    
+
     // Also optional support for query param ?threadId=...
     // const queryThreadId = searchParams.get(paramName);
 
@@ -46,7 +46,7 @@ export const useThreadIDParam = (options: UseThreadIDParamOptions = {}): UseThre
     const clearThreadId = useCallback(() => {
         setThreadId(null);
     }, [setThreadId]);
-    
+
     return {
         threadId,
         setThreadId,

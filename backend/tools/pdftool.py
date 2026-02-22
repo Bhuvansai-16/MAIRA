@@ -12,27 +12,29 @@ from pydantic import BaseModel, Field
 from langchain.tools import tool
 from langchain_core.runnables import RunnableConfig
 
-# Thread-safe storage for download data from subagent tool calls
-# Uses a global latest-download approach instead of thread IDs because
-# LangGraph runs tools via asyncio.run_in_executor() in a thread pool,
-# so the storing thread ID differs from the retrieving thread ID.
-_latest_download = None
+# Thread-safe storage for pending downloads indexed by filename
+_pending_downloads = {}
 _download_lock = threading.Lock()
 
 def _store_pending_download(data: dict):
-    """Store download data globally (latest wins)."""
-    global _latest_download
+    """Store download data globally (indexed by filename)."""
+    global _pending_downloads
     with _download_lock:
-        _latest_download = data
-        print(f"  💾 [pdftool] Download stored in pending: {data.get('filename', 'unknown')}")
+        if filename := data.get('filename'):
+            _pending_downloads[filename] = data
+            print(f"  💾 [pdftool] Download stored in pending: {filename}")
 
-def get_pending_download() -> dict | None:
-    """Retrieve and remove the latest pending download data."""
-    global _latest_download
+def get_pending_download(filename: str = None) -> dict | None:
+    """Retrieve and remove pending download data by filename."""
+    global _pending_downloads
     with _download_lock:
-        data = _latest_download
-        _latest_download = None
-        return data
+        if filename:
+            return _pending_downloads.pop(filename, None)
+        # Fallback to latest for legacy calls (if any)
+        if _pending_downloads:
+            latest_key = list(_pending_downloads.keys())[-1]
+            return _pending_downloads.pop(latest_key)
+        return None
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, KeepTogether, Image
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -112,29 +114,20 @@ def setup_level_styles(styles, report_level: str):
     styles.add(ParagraphStyle(
         'SectionHeading',
         parent=styles['Heading1'],
-        fontSize=16,
+        fontSize=18,
         spaceBefore=24,
         spaceAfter=12,
-        textColor=level_colors["heading"],
-        fontName='Helvetica-Bold'
+        textColor=colors.HexColor("#1E1B4B"),
+        fontName='Helvetica-Bold',
+        keepWithNext=True
     ))
     
-    # Body text style (level-appropriate)
-    if report_level == "student":
-        body_leading = 16  # More line spacing for readability
-        body_size = 11
-    elif report_level == "professor":
-        body_leading = 15
-        body_size = 11
-    else:  # researcher
-        body_leading = 14
-        body_size = 10
-    
+    # Body text style (Unified for premium feel)
     styles.add(ParagraphStyle(
         'LevelBody',
         parent=styles['BodyText'],
-        fontSize=body_size,
-        leading=body_leading,
+        fontSize=11,
+        leading=16,
         alignment=TA_JUSTIFY,
         fontName='Helvetica'
     ))
@@ -220,7 +213,7 @@ def create_table_flowable(table_data: list[list[str]], styles, report_level: str
             formatted_row.append(Paragraph(cell_text, style))
         formatted_data.append(formatted_row)
     
-    table = Table(formatted_data, colWidths=[col_width] * num_cols)
+    table = Table(formatted_data, colWidths=[col_width] * num_cols, repeatRows=1)
     
     # Level-specific table styling
     table_style = TableStyle([
@@ -250,6 +243,9 @@ def create_table_flowable(table_data: list[list[str]], styles, report_level: str
         # Alignment
         ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+
+        # Prevent individual rows from breaking across page boundaries
+        ('NOSPLIT', (0, 0), (-1, -1)),
     ])
     
     table.setStyle(table_style)
@@ -257,15 +253,27 @@ def create_table_flowable(table_data: list[list[str]], styles, report_level: str
 
 
 def process_markdown_formatting(text: str) -> str:
-    """Convert Markdown formatting to ReportLab HTML.
+    """Convert Markdown & LaTeX formatting to ReportLab HTML."""
     
-    Uses non-greedy matching for better handling of multiple formatting markers.
-    Also sanitizes HTML to be valid XML for ReportLab's paragraph parser.
+    # --- Step 0: Clean LaTeX Math & Code Blocks BEFORE escaping ---
+    # 1. Strip math delimiters like $ and $$
+    text = text.replace('$$', '')
+    text = re.sub(r'(?<!\\)\$([^\$]+)\$', r'\1', text)  # Removes inline $...$
+    text = text.replace(r'\$', '')
     
-    Strategy: First escape ALL angle brackets (so stray HTML tags like <para>,
-    <div>, <p> etc. from LLM output don't break ReportLab's XML parser), then
-    apply our Markdown-to-XML conversions which produce only valid ReportLab tags.
-    """
+    # 2. Convert common LaTeX symbols to Unicode so they render in standard PDF
+    math_replacements = {
+        r'\rightarrow': '→', r'\leftarrow': '←',
+        r'\Rightarrow': '⇒', r'\Leftarrow': '⇐',
+        r'\Lambda': 'Λ', r'\sigma': 'σ', r'\pm': '±',
+        r'\approx': '≈', r'\mu': 'μ', r'\pi': 'π',
+        r'\Delta': 'Δ', r'\times': '×', r'\leq': '≤',
+        r'\geq': '≥', r'\infty': '∞',
+        r'H_0': 'H₀', r'r_s': 'rₛ'
+    }
+    for old, new in math_replacements.items():
+        text = text.replace(old, new)
+
     # --- Step 1: Preserve <br> tags via placeholder, then escape all < > ---
     text = re.sub(r'<br\s*/?>', '\x00BR\x00', text, flags=re.IGNORECASE)
     text = text.replace('<', '&lt;').replace('>', '&gt;')
@@ -275,12 +283,18 @@ def process_markdown_formatting(text: str) -> str:
     text = re.sub(r'&(?!amp;|lt;|gt;|quot;|apos;|#)', '&amp;', text)
     
     # --- Step 3: Convert Markdown formatting to ReportLab XML tags ---
+    # Handle multi-line and single-line code blocks: ```text something ```
+    text = re.sub(r'```[a-zA-Z]*\s*(.+?)```', r'<font name="Courier">\1</font>', text, flags=re.DOTALL)
+    # Handle Inline code: `something`
+    text = re.sub(r'`([^`]+)`', r'<font name="Courier">\1</font>', text)
+    
     # **bold** → <b>bold</b> (non-greedy)
     text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
     # *italic* → <i>italic</i> (non-greedy, exclude asterisks in content)
     text = re.sub(r'\*([^*]+?)\*', r'<i>\1</i>', text)
     # [text](url) → <link href="url">text</link>
     text = re.sub(r'\[([^\]]+)\]\(([^\)]+)\)', r'<link href="\2" color="blue">\1</link>', text)
+    
     return text
 
 
@@ -316,36 +330,36 @@ def process_content_with_tables(content: str, styles, report_level: str) -> list
         raw_line = lines[i]  # Keep original for indentation-aware detection
 
         # ── Table detection ──
-        if line.startswith('|') and line.endswith('|') and line.count('|') >= 2:
-            if i + 1 < len(lines):
-                next_line = lines[i + 1].strip()
-                if re.match(r'^\|[\s\-:|]+\|$', next_line.replace(' ', '')):
-                    flush_paragraph()
-                    table_lines = [line, next_line]
-                    j = i + 2
-                    while j < len(lines):
-                        row_line = lines[j].strip()
-                        if row_line.startswith('|'):
-                            if not row_line.endswith('|'):
-                                row_line += ' |'
-                            table_lines.append(row_line)
-                            j += 1
-                        elif row_line == '':
-                            j += 1
-                        else:
-                            break
+        if (line.startswith('|') and line.endswith('|') and line.count('|') >= 2 
+            and i + 1 < len(lines) 
+            and re.match(r'^\|[\s\-:|]+\|$', lines[i + 1].strip().replace(' ', ''))):
+            flush_paragraph()
+            next_line = lines[i + 1].strip()
+            table_lines = [line, next_line]
+            j = i + 2
+            while j < len(lines):
+                row_line = lines[j].strip()
+                if row_line.startswith('|'):
+                    if not row_line.endswith('|'):
+                        row_line += ' |'
+                    table_lines.append(row_line)
+                    j += 1
+                elif row_line == '':
+                    j += 1
+                else:
+                    break
 
-                    table_text = '\n'.join(table_lines)
-                    table_data = parse_markdown_table(table_text)
-                    if table_data and len(table_data) > 1:
-                        table = create_table_flowable(table_data, styles, report_level)
-                        if table:
-                            flowables.append(Spacer(1, 12))
-                            flowables.append(table)
-                            flowables.append(Spacer(1, 12))
+            table_text = '\n'.join(table_lines)
+            table_data = parse_markdown_table(table_text)
+            if table_data and len(table_data) > 1:
+                table = create_table_flowable(table_data, styles, report_level)
+                if table:
+                    flowables.append(Spacer(1, 12))
+                    flowables.append(table)
+                    flowables.append(Spacer(1, 12))
 
-                    i = j
-                    continue
+            i = j
+            continue
 
         # ── Image markdown: ![caption](url) ──
         img_match = re.match(r'^!\[([^\]]*)\]\(([^\)]+)\)$', line)
@@ -354,7 +368,7 @@ def process_content_with_tables(content: str, styles, report_level: str) -> list
             caption = img_match.group(1)
             img_url = img_match.group(2)
             try:
-                response = requests.get(img_url, timeout=10, headers={
+                response = requests.get(img_url, timeout=5, headers={
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                 })
                 if response.status_code == 200:
@@ -383,7 +397,7 @@ def process_content_with_tables(content: str, styles, report_level: str) -> list
             if heading_match:
                 text = heading_match.group(2).strip()
                 flowables.append(Paragraph(text, styles['SectionHeading']))
-                flowables.append(Spacer(1, 12))
+                # Removed manual spacer - rely on style.spaceAfter
             i += 1
             continue
 
@@ -401,14 +415,17 @@ def process_content_with_tables(content: str, styles, report_level: str) -> list
                     num = match.group(1)
                     text = process_markdown_formatting(match.group(2))
                     flowables.append(Paragraph(f'{num}. {text}', styles['LevelBullet']))
-            flowables.append(Spacer(1, 4))
+            # Minimized spacing between list items for compact look
+            flowables.append(Spacer(1, 1))
             i += 1
             continue
 
         # ── Empty line → flush current paragraph, add spacing ──
         if not line:
             flush_paragraph()
-            flowables.append(Spacer(1, 8))
+            # COALESCE: Only add spacer if we haven't just added one (avoid huge gaps)
+            if flowables and not isinstance(flowables[-1], Spacer):
+                flowables.append(Spacer(1, 8))
             i += 1
             continue
 
@@ -422,10 +439,28 @@ def process_content_with_tables(content: str, styles, report_level: str) -> list
 
 def create_cover_page(report_title: str, report_level: str, styles) -> list:
     """Create a professional cover page with better title wrapping."""
+    import os
     cover = []
-    cover.append(Spacer(1, 2.5 * inch))
-
-    level_colors = get_level_colors(report_level)
+    
+    # --- INJECT MAIRA LOGO ---
+    # logo_path is relative to the backend root or absolute
+    logo_path = os.path.join(os.path.dirname(__file__), "logo", "DarkLogo.png")
+    
+    if os.path.exists(logo_path):
+        try:
+            # Increase logo size for better visibility
+            logo = Image(logo_path, width=3.5*inch, height=1.8*inch, kind='proportional')
+            logo.hAlign = 'CENTER' # Centers it beautifully on the page
+            cover.append(Spacer(1, 1.5 * inch))
+            cover.append(logo)
+            cover.append(Spacer(1, 0.5 * inch)) # Adds breathing room below the logo
+        except Exception as e:
+            print(f"⚠️ Could not load logo into PDF: {e}")
+            cover.append(Spacer(1, 2.5 * inch))
+    else:
+        # Fallback spacing if the logo file is accidentally deleted
+        cover.append(Spacer(1, 2.5 * inch))
+    # ------------------------------
 
     # Split long titles at colon for better wrapping
     if ':' in report_title:
@@ -447,18 +482,10 @@ def create_cover_page(report_title: str, report_level: str, styles) -> list:
     else:
         cover.append(Paragraph(report_title, styles['CoverTitle']))
 
-    cover.append(Spacer(1, 0.8 * inch))
+    cover.append(Spacer(1, 1.2 * inch))
 
-    level_subtitles = {
-        "student": "An Educational Guide",
-        "professor": "A Teaching Resource",
-        "researcher": "A Research Report"
-    }
-    subtitle = level_subtitles.get(report_level, "Report")
-    cover.append(Paragraph(subtitle, styles['CoverSubtitle']))
-    cover.append(Spacer(1, 0.5 * inch))
-
-    date_text = f"Generated: {datetime.now().strftime('%B %d, %Y')}"
+    # Remove level subtitles for premium feel
+    date_text = datetime.now().strftime('%B %d, %Y')
     cover.append(Paragraph(date_text, styles['Italic']))
     cover.append(Spacer(1, 12))
     cover.append(Paragraph("MAIRA Research Agent", styles['Italic']))
@@ -526,14 +553,16 @@ def export_to_pdf(
     for section in sections:
         # Section Heading
         story.append(Paragraph(section.heading, styles['SectionHeading']))
-        story.append(Spacer(1, 12))
+        # Spacer removed - handled by SectionHeading.spaceAfter
 
         # Process content with table and formatting support
         # This supports inline images via ![caption](url) markdown syntax
         content_flowables = process_content_with_tables(section.content, styles, report_level)
         story.extend(content_flowables)
         
-        story.append(Spacer(1, 20))  # Section spacing
+        # Only add spacing if not the last section to avoid extra blank page
+        if section != sections[-1]:
+            story.append(Spacer(1, 20))  # Section spacing
 
     try:
         doc.build(story)

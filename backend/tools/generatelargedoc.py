@@ -1,5 +1,5 @@
 from langchain.tools import tool
-from latexagent import latex_chain
+from agent.backend.latexagent import latex_chain
 from tools.splittool import split_latex_document
 from tools.latextoformate import convert_latex_to_all_formats
 @tool

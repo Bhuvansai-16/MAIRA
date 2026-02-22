@@ -46,7 +46,7 @@ export const AuthProvider = ({ children }: AuthProviderProps) => {
                 } else {
                     setSession(session);
                     setUser(session?.user ?? null);
-                    
+
                     // Sync user on initial load if session exists
                     if (session?.user) {
                         try {
@@ -99,7 +99,7 @@ export const AuthProvider = ({ children }: AuthProviderProps) => {
                 avatar_url: user.user_metadata?.avatar_url,
                 auth_provider: user.app_metadata?.provider || 'email',
             });
-            
+
             if (response.data.success) {
                 console.log('✅ User synced to backend:', response.data);
             }

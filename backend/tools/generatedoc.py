@@ -1,6 +1,6 @@
 # Complete workflow: Generate LaTeX and convert to all formats
 from langchain.tools import tool
-from latexagent import latex_chain
+from agent.backend.latexagent import latex_chain
 from tools.latextoformate import convert_latex_to_all_formats
 
 @tool

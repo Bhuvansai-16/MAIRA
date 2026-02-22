@@ -18,6 +18,7 @@ from .postgres import (
     reset_pool,
     reset_checkpointer_pool,
     validate_pool,
+    validate_checkpointer_pool,
     ensure_healthy_pool,
     _is_transient_error,
     # User management
@@ -63,6 +64,7 @@ __all__ = [
     'reset_pool',
     'reset_checkpointer_pool',
     'validate_pool',
+    'validate_checkpointer_pool',
     'ensure_healthy_pool',
     '_is_transient_error',
     # User management

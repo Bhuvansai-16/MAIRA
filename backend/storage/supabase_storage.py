@@ -30,7 +30,7 @@ load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://pteanoqxjpdumsazcalr.supabase.co")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB0ZWFub3F4anBkdW1zYXpjYWxyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk3ODQ2MjYsImV4cCI6MjA4NTM2MDYyNn0.zIvBdFuB0L6yLNHWEo6YxyctLRHNkVerq8jpVDGioZw")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 
 # Bucket names
 BUCKETS = {

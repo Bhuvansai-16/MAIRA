@@ -1,18 +1,20 @@
 # Backend for MAIRA Deep Research Agent
-# Synchronous version - no async/await patterns
+# Production-ready synchronous version
+# Version: 2.0.0
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 from typing import Optional, List, Dict, Any
-from main_agent import agent, prompt_v2, subagents, tools, checkpointer
+from main_agent import get_agent, prompt_v2, subagents, tools
 from deepagents import create_deep_agent
 import database as _db
 from database import (
     pool, 
     reset_pool,
     validate_pool,
+    validate_checkpointer_pool,
     ensure_healthy_pool,
     _is_transient_error,
     get_user_by_id,
@@ -41,7 +43,7 @@ from database import (
 from config import AVAILABLE_MODELS, get_current_model_info, set_current_model, get_model_instance
 import config
 from thread_manager import thread_manager, Thread, CheckpointInfo
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import uuid
 from collections import defaultdict
@@ -49,9 +51,40 @@ import threading
 import queue
 import time
 import download_store
+import logging
+import traceback
+
+# =====================================================
+# PRODUCTION CONFIGURATION
+# =====================================================
+
+# Configure logging for production
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# Session cleanup configuration
+SESSION_TIMEOUT_MINUTES = 60  # Clean up sessions older than this
+SESSION_CLEANUP_INTERVAL = 300  # Run cleanup every 5 minutes
+
+# Request limits
+MAX_PROMPT_LENGTH = 50000  # Maximum characters in a prompt
+MAX_SITES_COUNT = 20  # Maximum number of site restrictions
 
 # Active session tracking for reconnection support
 # Stores: thread_id -> {"status": "running"|"completed"|"error", "events": [], "last_content": str, "prompt": str}
+try:
+    from redis_client import redis_client
+except ImportError:
+    redis_client = None
+
+import json
+from datetime import datetime
+
+# Global state - Fallback if Redis is not available
 active_sessions: Dict[str, Dict[str, Any]] = {}
 session_locks: Dict[str, threading.Lock] = defaultdict(threading.Lock)
 
@@ -62,19 +95,244 @@ message_queues: Dict[str, queue.Queue] = {}
 # Background thread references
 background_threads: Dict[str, threading.Thread] = {}
 
-app = FastAPI(title="MAIRA – Deep Research Agent")
+# Per-thread cancellation events — set when /cancel is called
+# Using threading.Event gives O(1) signalling that is safe across threads
+cancellation_events: Dict[str, threading.Event] = {}
+
+# =====================================================
+# AGENT CACHING & REFRESH (Fix 2)
+# =====================================================
+_agent_instance = None
+_agent_lock = threading.Lock()
+
+def get_or_refresh_agent(force_refresh: bool = False):
+    """
+    Get or refresh the main agent instance.
+    Ensures the agent always uses the latest connection pools.
+    """
+    global _agent_instance
+    with _agent_lock:
+        if _agent_instance is None or force_refresh:
+            if force_refresh:
+                print("🔄 Refreshing agent instance (stale pool or manual refresh)")
+            _agent_instance = get_agent()
+    return _agent_instance
+
+# =====================================================
+# REDIS SESSION HELPERS
+# =====================================================
+
+def init_session(thread_id: str, data: dict):
+    """Initialize a session in Redis AND local memory (dual-write for reconnect support)"""
+    # Always populate in-memory for reconnect stream endpoints
+    active_sessions[thread_id] = data
+    
+    if redis_client:
+        try:
+            # Separate events and metadata
+            mapping = {k: v for k, v in data.items() if k != "events"}
+            # Serialize complex types
+            serialized_mapping = {}
+            for k, v in mapping.items():
+                if isinstance(v, (list, dict, bool)):
+                    serialized_mapping[k] = json.dumps(v)
+                elif v is None:
+                    serialized_mapping[k] = ""
+                else:
+                    serialized_mapping[k] = str(v)
+            
+            key = f"session:{thread_id}"
+            pipeline = redis_client.pipeline()
+            pipeline.delete(key)
+            pipeline.delete(f"{key}:events")
+            if serialized_mapping:
+                pipeline.hset(key, values=serialized_mapping)
+            # Set TTL (24 hours)
+            pipeline.expire(key, 86400)
+            pipeline.exec()
+        except Exception as e:
+            print(f"⚠️ Redis init_session failed: {e}")
+
+def append_event(thread_id: str, event: dict):
+    """Append event to session history (dual-write: in-memory + Redis)"""
+    # Always update in-memory for reconnect stream endpoints
+    if thread_id in active_sessions:
+        active_sessions[thread_id]["events"].append(event)
+        if event.get("messages"):
+            for msg in event["messages"]:
+                if msg.get("content"):
+                    active_sessions[thread_id]["last_content"] = msg["content"]
+    
+    if redis_client:
+        try:
+            key = f"session:{thread_id}"
+            pipeline = redis_client.pipeline()
+            pipeline.rpush(f"{key}:events", json.dumps(event))
+            pipeline.expire(f"{key}:events", 86400) # Refresh TTL
+            
+            # Update last_content if present
+            if event.get("messages"):
+                for msg in event["messages"]:
+                    if msg.get("content"):
+                         pipeline.hset(key, values={"last_content": msg["content"]})
+            pipeline.exec()
+        except Exception as e:
+            print(f"⚠️ Redis append_event failed: {e}")
+
+def update_session_status(thread_id: str, status: str, extra_updates: dict = None):
+    """Update session status and other fields (dual-write: in-memory + Redis)"""
+    # Always update in-memory for reconnect stream endpoints
+    if thread_id in active_sessions:
+        active_sessions[thread_id]["status"] = status
+        if extra_updates:
+            active_sessions[thread_id].update(extra_updates)
+    
+    if redis_client:
+        try:
+            updates = {"status": status}
+            if extra_updates:
+                for k, v in extra_updates.items():
+                    if isinstance(v, (list, dict, bool)):
+                        updates[k] = json.dumps(v)
+                    elif v is None:
+                        updates[k] = ""
+                    else:
+                        updates[k] = str(v)
+            
+            redis_client.hset(f"session:{thread_id}", values=updates)
+        except Exception as e:
+             print(f"⚠️ Redis update_session_status failed: {e}")
+
+def get_session_status(thread_id: str):
+    """Get session status"""
+    if redis_client:
+        try:
+            return redis_client.hget(f"session:{thread_id}", "status")
+        except Exception:
+            pass
+    
+    return active_sessions.get(thread_id, {}).get("status")
+
+# Last cleanup timestamp
+_last_session_cleanup = time.time()
+
+app = FastAPI(
+    title="MAIRA – Deep Research Agent",
+    version="2.0.0",
+    description="Production-ready AI research assistant with deep search capabilities"
+)
+
+
+# =====================================================
+# SESSION CLEANUP (Production Memory Management)
+# =====================================================
+
+def get_session_metadata(thread_id: str):
+    """Get full session metadata"""
+    if redis_client:
+        try:
+            data = redis_client.hgetall(f"session:{thread_id}")
+            if data:
+                return data
+        except Exception:
+            pass
+    return active_sessions.get(thread_id)
+
+def cleanup_old_sessions():
+    """Remove completed/errored sessions and queues."""
+    global _last_session_cleanup
+    
+    current_time = time.time()
+    if current_time - _last_session_cleanup < SESSION_CLEANUP_INTERVAL:
+        return  # Not time yet
+    
+    _last_session_cleanup = current_time
+    cutoff = datetime.now() - timedelta(minutes=SESSION_TIMEOUT_MINUTES)
+    
+    # 1. Clean up fallback active_sessions
+    sessions_to_remove = []
+    for thread_id, session in list(active_sessions.items()):
+        if session.get("status") in ("completed", "error", "cancelled"):
+            started_at = session.get("started_at")
+            if started_at:
+                try:
+                    session_time = datetime.fromisoformat(started_at)
+                    if session_time < cutoff:
+                        sessions_to_remove.append(thread_id)
+                except (ValueError, TypeError):
+                    sessions_to_remove.append(thread_id)
+    
+    for thread_id in sessions_to_remove:
+        active_sessions.pop(thread_id, None)
+        message_queues.pop(thread_id, None)
+        background_threads.pop(thread_id, None)
+
+    # 2. Clean up message_queues for Redis-managed sessions
+    # (If thread_id is not in active_sessions, it's likely Redis-only)
+    if redis_client:
+        for thread_id in list(message_queues.keys()):
+            if thread_id in active_sessions:
+                continue
+
+            # Check Redis status
+            meta = get_session_metadata(thread_id)
+            if not meta:
+                # Session expired/gone from Redis
+                message_queues.pop(thread_id, None)
+                background_threads.pop(thread_id, None)
+                continue
+            
+            # Check status and time
+            status = meta.get("status")
+            started_at = meta.get("started_at")
+            
+            should_remove = False
+            if status in ("completed", "error", "cancelled"):
+                if started_at:
+                    try:
+                        session_time = datetime.fromisoformat(started_at)
+                        if session_time < cutoff:
+                            should_remove = True
+                    except (ValueError, TypeError):
+                         should_remove = True # Bad data
+                else:
+                    should_remove = True # No start time
+            
+            if should_remove:
+                message_queues.pop(thread_id, None)
+                background_threads.pop(thread_id, None)
+                # We don't delete from Redis here, relying on TTL (24h) 
+                # or we could explicitly delete if we want stricter cleanup.
+    
+    if sessions_to_remove:
+        logger.info(f"🧹 Cleaned up {len(sessions_to_remove)} old sessions")
 
 # Apply lifespan manually using startup/shutdown events
 @app.on_event("startup")
 def startup_event():
-    # 1. Pool is already opened in main_agent.py when importing agent
+    # 1. Pool is already opened in main_agent.py
     
-    # 2. Validate pool health on startup
+    # 2. Validate CRUD pool health on startup
     if not validate_pool():
-        print("⚠️ Pool unhealthy on startup, resetting...")
+        print("⚠️ CRUD pool unhealthy on startup, resetting...")
         reset_pool()
     
-    # 3. Ensure default user exists (required for thread foreign key)
+    # 3. Validate checkpointer pool health on startup
+    try:
+        import database as _db
+        with _db._checkpointer_pool.connection(timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        print("✅ Checkpointer pool healthy")
+    except Exception as e:
+        print(f"⚠️ Checkpointer pool unhealthy on startup: {e}")
+        try:
+            _db.reset_checkpointer_pool()
+            print("✅ Checkpointer pool reset on startup")
+        except Exception as reset_err:
+            print(f"⚠️ Could not reset checkpointer pool: {reset_err}")
+    
+    # 4. Ensure default user exists (required for thread foreign key)
     try:
         with _db.pool.connection() as conn:
             with conn.cursor() as cur:
@@ -90,15 +348,34 @@ def startup_event():
     except Exception as e:
         print(f"⚠️ Could not verify default user: {e}")
     
-    # 4. Set agent directly (already initialized in main_agent.py)
-    app.state.agent = agent
     print("✅ MAIRA Agent ready")
 
 
+_shutting_down = False  # Flag for background threads to detect server shutdown
+
 @app.on_event("shutdown")
 def shutdown_event():
-    _db.pool.close()
-    _db._checkpointer_pool.close()
+    global _shutting_down
+    _shutting_down = True
+    
+    # Give active background threads a chance to finish gracefully
+    active_threads = {tid: t for tid, t in background_threads.items() if t.is_alive()}
+    if active_threads:
+        print(f"⏳ Waiting for {len(active_threads)} background thread(s) to finish...")
+        for tid, t in active_threads.items():
+            t.join(timeout=5)  # Wait max 5s per thread
+            if t.is_alive():
+                print(f"   ⚠️ Thread {tid} still running after timeout, proceeding with shutdown")
+    
+    # Now safe to close pools
+    try:
+        _db.pool.close()
+    except Exception:
+        pass
+    try:
+        _db._checkpointer_pool.close()
+    except Exception:
+        pass
     print("✅ All database connection pools closed")
 
 app.add_middleware(
@@ -116,8 +393,14 @@ app.add_middleware(
 
 @app.get("/health")
 def health_check():
-    """Production health check — verifies DB pool connectivity."""
+    """Production health check — verifies DB pool connectivity including SSL."""
+    # Check CRUD pool (handles its own reset if closed)
     db_ok = validate_pool()
+    
+    # Check checkpointer pool (handles its own reset/recovery)
+    checkpointer_ok = validate_checkpointer_pool()
+    
+    import database as _db
     pool_stats = {
         "min_size": _db.pool.min_size,
         "max_size": _db.pool.max_size,
@@ -128,10 +411,18 @@ def health_check():
     except Exception:
         pass
 
-    status = "healthy" if db_ok else "degraded"
+    # Overall status considers both pools
+    if db_ok and checkpointer_ok:
+        status = "healthy"
+    elif db_ok or checkpointer_ok:
+        status = "degraded"
+    else:
+        status = "unhealthy"
+    
     return {
         "status": status,
         "database": "connected" if db_ok else "disconnected",
+        "checkpointer": "connected" if checkpointer_ok else "disconnected",
         "pool": pool_stats,
         "active_sessions": len(active_sessions),
         "background_threads": len(background_threads),
@@ -156,6 +447,22 @@ class AgentRequest(BaseModel):
     edit_group_id: Optional[str] = None  # Groups edited messages together (same logical message)
     edit_version: Optional[int] = None  # Version number within the edit group
     original_message_index: Optional[int] = None  # Original position in conversation
+    
+    @validator('prompt')
+    def validate_prompt(cls, v):
+        """Validate prompt is not empty and within size limits."""
+        if not v or not v.strip():
+            raise ValueError('Prompt cannot be empty')
+        if len(v) > MAX_PROMPT_LENGTH:
+            raise ValueError(f'Prompt exceeds maximum length of {MAX_PROMPT_LENGTH} characters')
+        return v.strip()
+    
+    @validator('sites')
+    def validate_sites(cls, v):
+        """Validate sites list is within limits."""
+        if v and len(v) > MAX_SITES_COUNT:
+            raise ValueError(f'Maximum {MAX_SITES_COUNT} site restrictions allowed')
+        return v
 
 
 class CreateThreadRequest(BaseModel):
@@ -211,13 +518,49 @@ class SyncUserRequest(BaseModel):
 
 
 # -----------------------------
-# Health Check Endpoint
+# Pool Recovery Endpoint
 # -----------------------------
 
-@app.get("/health")
-def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "service": "MAIRA Deep Research Agent"}
+@app.post("/pools/recover")
+def recover_pools():
+    """
+    Manually trigger recovery of SSL/database connection pools.
+    Use this endpoint when experiencing persistent SSL errors.
+    """
+    results = {"crud_pool": "unknown", "checkpointer_pool": "unknown"}
+    
+    # Recover CRUD pool
+    try:
+        reset_pool()
+        if validate_pool():
+            results["crud_pool"] = "recovered"
+        else:
+            results["crud_pool"] = "failed"
+    except Exception as e:
+        results["crud_pool"] = f"error: {str(e)[:100]}"
+    
+    # Recover checkpointer pool
+    try:
+        from database import reset_checkpointer_pool, _checkpointer_pool
+        reset_checkpointer_pool()
+        # Verify recovery
+        with _checkpointer_pool.connection(timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        results["checkpointer_pool"] = "recovered"
+    except Exception as e:
+        results["checkpointer_pool"] = f"error: {str(e)[:100]}"
+    
+    overall_status = "success" if all(
+        v == "recovered" for v in results.values()
+    ) else "partial" if any(
+        v == "recovered" for v in results.values()
+    ) else "failed"
+    
+    return {
+        "status": overall_status,
+        "pools": results
+    }
 
 
 # -----------------------------
@@ -278,7 +621,7 @@ def _inject_upload_context(
     """
     from langchain_core.messages import HumanMessage, AIMessage
 
-    agent = http_request.app.state.agent
+    agent = get_agent()
     config = {"configurable": {"thread_id": thread_id}}
 
     # Create a user message that tells the agent about the upload
@@ -440,7 +783,7 @@ def upload_image_document(
             import base64
             from langchain_google_genai import ChatGoogleGenerativeAI
 
-            vision_model = ChatGoogleGenerativeAI(model="models/gemini-2.0-flash", temperature=0)
+            vision_model = ChatGoogleGenerativeAI(model="models/gemini-2.5-flash", temperature=0)
             b64_image = base64.b64encode(image_bytes).decode("utf-8")
 
             response = vision_model.invoke(
@@ -548,12 +891,8 @@ def select_model(request: ModelSelectRequest, http_request: Request):
     # Update the current model
     set_current_model(request.model_key)
     
-    # Recreate the main agent with the new model
+    # REFRESH SUBAGENT MODELS: Update subagents list to use current model logic
     try:
-        new_model = get_model_instance(request.model_key)
-        
-        # KEY FIX: Update SUBAGENTS to use the new subagent_model from config
-        # This ensures subagents switch model according to the logic in config.py
         current_subagent_model = config.subagent_model
         
         # Iterate through the subagents list (imported from main_agent) and update their model
@@ -561,15 +900,6 @@ def select_model(request: ModelSelectRequest, http_request: Request):
             if isinstance(subagent_config, dict) and "model" in subagent_config:
                 subagent_config["model"] = current_subagent_model
                 
-        # Recreate main agent with new model and UPDATED subagents
-        http_request.app.state.agent = create_deep_agent(
-            subagents=subagents,  # Now contains updated models
-            model=new_model,
-            tools=tools,
-            system_prompt=prompt_v2,
-            checkpointer=checkpointer,
-        )
-        
         subagent_name = type(current_subagent_model).__name__
         return {
             "status": "success",
@@ -789,7 +1119,7 @@ def setup_database():
 def test_database(request: Request):
     """Test database connection with a simple HI message"""
     try:
-        agent = request.app.state.agent
+        agent = get_agent()
         test_thread_id = f"test-{uuid.uuid4().hex[:8]}"
         config = {"configurable": {"thread_id": test_thread_id}}
         
@@ -1029,7 +1359,7 @@ def verify_thread_deletion(thread_id: str):
 def get_thread_messages(thread_id: str, request: Request):
     """Get all messages for a specific thread"""
     try:
-        agent = request.app.state.agent
+        agent = get_agent()
         # Get state from checkpointer using thread_id config
         config = {"configurable": {"thread_id": thread_id}}
         state = agent.get_state(config)
@@ -1054,10 +1384,40 @@ def get_thread_messages(thread_id: str, request: Request):
                 msg_data = _serialize_message(msg)
                 if msg_data:
                     messages.append(msg_data)
-        
+
+        # ── Download injection: always look up Supabase for this thread ──────
+        # Checkpoint messages have their [DOWNLOAD_PDF] markers stripped during
+        # serialization, so msg.download never gets set from the message content.
+        # We directly embed the full base64 data so the frontend only needs one
+        # round-trip (this endpoint) and does NOT need to call /downloads.
+        try:
+            supabase_downloads = download_store.get_downloads_from_supabase(thread_id)
+            if supabase_downloads:
+                print(f"  ☁️  Injecting {len(supabase_downloads)} Supabase download(s) into history messages")
+                # Find the last AI/assistant message index
+                last_ai_idx = None
+                for i in range(len(messages) - 1, -1, -1):
+                    m = messages[i]
+                    if m.get("type") in ("ai", "assistant") or m.get("role") in ("ai", "assistant", "agent"):
+                        last_ai_idx = i
+                        break
+
+                if last_ai_idx is not None:
+                    # Attach the primary download with full base64 data embedded
+                    primary = supabase_downloads[0]
+                    messages[last_ai_idx]["download"] = {
+                        "filename": primary.get("filename", "report"),
+                        "data": primary.get("data", "")  # full base64 — no second /downloads fetch needed
+                    }
+                    print(f"  📎 Injected full download '{primary.get('filename')}' ({len(primary.get('data',''))} chars) into message [{last_ai_idx}]")
+        except Exception as dl_inject_err:
+            print(f"  ⚠️ Download injection failed (non-fatal): {dl_inject_err}")
+
         return {"thread_id": thread_id, "messages": messages}
     except Exception as e:
         return {"thread_id": thread_id, "messages": [], "error": str(e)}
+
+
 
 
 @app.get("/threads/{thread_id}/downloads")
@@ -1078,7 +1438,7 @@ def get_thread_downloads(thread_id: str):
 def get_thread_history(thread_id: str, request: Request):
     """Get checkpoint history for time travel functionality"""
     try:
-        agent = request.app.state.agent
+        agent = get_agent()
         config = {"configurable": {"thread_id": thread_id}}
         checkpoints = []
         
@@ -1108,7 +1468,7 @@ def get_thread_history(thread_id: str, request: Request):
 def branch_from_checkpoint(thread_id: str, request: BranchRequest, http_request: Request):
     """Create a new branch from a specific checkpoint (fork conversation)"""
     try:
-        agent = http_request.app.state.agent
+        agent = get_agent()
         # Create new thread for the branch
         new_thread = thread_manager.create_branch(
             parent_thread_id=thread_id,
@@ -1148,7 +1508,7 @@ def branch_from_checkpoint(thread_id: str, request: BranchRequest, http_request:
 def get_checkpoint_state(thread_id: str, checkpoint_id: str, request: Request):
     """Get the state at a specific checkpoint for time travel preview"""
     try:
-        agent = request.app.state.agent
+        agent = get_agent()
         config = {
             "configurable": {
                 "thread_id": thread_id,
@@ -1184,8 +1544,9 @@ def get_checkpoint_state(thread_id: str, checkpoint_id: str, request: Request):
 # -----------------------------
 
 @app.get("/sessions/{thread_id}/status")
-def get_session_status(thread_id: str):
+def get_session_status_endpoint(thread_id: str):
     """Get the status of an active agent session for reconnection support"""
+    # Check in-memory first
     if thread_id in active_sessions:
         session = active_sessions[thread_id]
         return {
@@ -1197,6 +1558,37 @@ def get_session_status(thread_id: str):
             "prompt": session.get("prompt", ""),
             "deep_research": session.get("deep_research", False)
         }
+    
+    # Check Redis if not in memory
+    if redis_client:
+        try:
+            key = f"session:{thread_id}"
+            session_data = redis_client.hgetall(key)
+            if session_data:
+                status = session_data.get("status", "unknown")
+                deep_research = session_data.get("deep_research", "false")
+                # Parse boolean from Redis string
+                if isinstance(deep_research, str):
+                    deep_research = deep_research.lower() in ("true", "1", "yes")
+                
+                event_count = 0
+                try:
+                    event_count = redis_client.llen(f"{key}:events") or 0
+                except Exception:
+                    pass
+                
+                return {
+                    "thread_id": thread_id,
+                    "status": status,
+                    "has_active_stream": status == "running",
+                    "event_count": event_count,
+                    "last_content": session_data.get("last_content", ""),
+                    "prompt": session_data.get("prompt", ""),
+                    "deep_research": deep_research
+                }
+        except Exception as e:
+            print(f"⚠️ Redis get_session_status failed: {e}")
+    
     return {
         "thread_id": thread_id,
         "status": "none",
@@ -1229,7 +1621,8 @@ def get_session_events(thread_id: str, from_index: int = 0):
 def cancel_session(thread_id: str):
     """
     Cancel an active agent session.
-    Sets a cancellation flag that the background thread checks during execution.
+    Sets a threading.Event that the background thread polls every second
+    so it can exit even while blocked inside agent.stream() / a tool call.
     """
     if thread_id not in active_sessions:
         return {"thread_id": thread_id, "status": "not_found", "message": "No active session found"}
@@ -1244,11 +1637,16 @@ def cancel_session(thread_id: str):
             "message": f"Session is already {current_status}"
         }
     
-    # Set the cancellation flag
+    # 1. Set the dict-level flag (legacy check still used in a few places)
     session["cancelled"] = True
     session["status"] = "cancelled"
     
-    # Send cancellation event to any connected clients
+    # 2. Signal the threading.Event so the polling loop wakes up immediately
+    if thread_id in cancellation_events:
+        cancellation_events[thread_id].set()
+        print(f"🛑 Cancellation event set for thread {thread_id}")
+    
+    # 3. Send cancellation event to any connected SSE clients
     if thread_id in message_queues:
         try:
             cancel_event = {
@@ -1274,26 +1672,65 @@ def reconnect_session_stream(thread_id: str, from_index: int = 0):
     Reconnect to an active session's event stream.
     First replays all buffered events, then streams live updates.
     """
-    if thread_id not in active_sessions:
+    # Check in-memory first
+    session = active_sessions.get(thread_id)
+    
+    # Check Redis if not in memory
+    redis_session = None
+    if not session and redis_client:
+        try:
+            key = f"session:{thread_id}"
+            redis_data = redis_client.hgetall(key)
+            if redis_data:
+                redis_session = redis_data
+        except Exception as e:
+            print(f"⚠️ Redis reconnect lookup failed: {e}")
+    
+    if not session and not redis_session:
         raise HTTPException(status_code=404, detail="No active session found")
     
-    session = active_sessions[thread_id]
+    def get_session_field(field, default=None):
+        """Get a field from in-memory session or Redis"""
+        if session:
+            return session.get(field, default)
+        if redis_session:
+            val = redis_session.get(field, default)
+            # Parse bool/json strings from Redis
+            if isinstance(val, str) and val.lower() in ("true", "false"):
+                return val.lower() == "true"
+            return val
+        return default
     
     def reconnect_generator():
         try:
             # 1. First, replay all buffered events from the requested index
-            events = session.get("events", [])
-            for i, event in enumerate(events[from_index:], start=from_index):
+            events = []
+            if session:
+                events = session.get("events", [])
+            elif redis_client:
+                try:
+                    key = f"session:{thread_id}"
+                    raw_events = redis_client.lrange(f"{key}:events", from_index, -1)
+                    events = [json.loads(e) for e in (raw_events or [])]
+                except Exception as e:
+                    print(f"⚠️ Redis event replay failed: {e}")
+
+            for i, event in enumerate(events if not session else events[from_index:], start=from_index):
                 yield f"data: {json.dumps({**event, 'replayed': True, 'index': i})}\n\n"
             
-            last_sent = len(events)
+            last_sent = len(events) if not session else len(events)
             
             # 2. If session is still running, poll the queue for live updates
-            if session.get("status") == "running":
+            status = get_session_field("status", "unknown")
+            if status == "running":
                 q = message_queues.get(thread_id)
                 
                 if q:
-                    while session.get("status") == "running":
+                    while True:
+                        # Re-check status
+                        current_status = get_session_field("status", "unknown")
+                        if current_status != "running":
+                            break
                         try:
                             event = q.get(timeout=30.0)
                             yield f"data: {json.dumps(event)}\n\n"
@@ -1303,11 +1740,12 @@ def reconnect_session_stream(thread_id: str, from_index: int = 0):
                         except queue.Empty:
                             # Send keepalive and check status
                             yield f"data: {json.dumps({'type': 'ping'})}\n\n"
-                            if session.get("status") != "running":
-                                break
-                else:
-                    # No queue, poll the events buffer
-                    while session.get("status") == "running":
+                elif session:
+                    # No queue, poll the events buffer (in-memory only)
+                    while True:
+                        current_status = get_session_field("status", "unknown")
+                        if current_status != "running":
+                            break
                         time.sleep(0.1)
                         current_events = session.get("events", [])
                         if len(current_events) > last_sent:
@@ -1316,7 +1754,8 @@ def reconnect_session_stream(thread_id: str, from_index: int = 0):
                             last_sent = len(current_events)
             
             # 3. Send final status
-            yield f"data: {json.dumps({'type': 'reconnect_complete', 'status': session.get('status')})}\n\n"
+            final_status = get_session_field("status", "completed")
+            yield f"data: {json.dumps({'type': 'reconnect_complete', 'status': final_status})}\n\n"
             
         except Exception as e:
             # Client disconnected during reconnect
@@ -1331,9 +1770,47 @@ def reconnect_session_stream(thread_id: str, from_index: int = 0):
 
 # Maximum retries for transient DB/SSL errors during streaming
 _MAX_STREAM_RETRIES = 3
+_SSL_RETRY_BASE_DELAY = 2  # Base delay in seconds for exponential backoff
 
 
-def _stream_with_retry(agent, stream_input, config, thread_id, store_event):
+
+
+def _recover_checkpointer(agent):
+    """
+    Attempt to recover the checkpointer after an SSL failure.
+    Returns the new checkpointer or None if recovery failed.
+    """
+    try:
+        from database import reset_checkpointer_pool, get_checkpointer
+        
+        # Reset the pool to clear dead SSL connections
+        reset_checkpointer_pool()
+        
+        # FIX 2: Refresh the agent instance so new requests use fresh pools
+        get_or_refresh_agent(force_refresh=True)
+        
+        # Get a fresh checkpointer instance
+        new_checkpointer = get_checkpointer()
+        
+        # Update the CURRENT agent's checkpointer if possible
+        # langgraph stores checkpointer in different places depending on version
+        if hasattr(agent, 'checkpointer'):
+            agent.checkpointer = new_checkpointer
+        if hasattr(agent, '_checkpointer'):
+            agent._checkpointer = new_checkpointer
+        
+        # Also try to update via config if available
+        if hasattr(agent, 'config') and isinstance(agent.config, dict):
+            agent.config['checkpointer'] = new_checkpointer
+        
+        print("   ✅ Checkpointer recovered successfully")
+        return new_checkpointer
+    except Exception as e:
+        print(f"   ⚠️ Checkpointer recovery failed: {e}")
+        return None
+
+
+def _stream_with_retry(agent, stream_input, config, thread_id, store_event, stop_event: Optional[threading.Event] = None):
     """
     Generator that wraps agent.stream() with automatic retry on transient
     database/SSL errors.  The checkpointer uses its own dedicated pool
@@ -1342,47 +1819,72 @@ def _stream_with_retry(agent, stream_input, config, thread_id, store_event):
     """
     attempt = 0
     current_input = stream_input
+    last_successful_chunk = None
 
     while attempt <= _MAX_STREAM_RETRIES:
+        # Check if already cancelled before starting
+        if stop_event and stop_event.is_set():
+            return
+
         try:
-            yield from agent.stream(
+            # 1. Assign the stream to a variable so we can control it
+            stream_iter = agent.stream(
                 current_input,
                 config=config,
                 stream_mode="updates"
             )
-            return  # Stream completed successfully
+            try:
+                for chunk in stream_iter:
+                    # Check for cancellation between chunks
+                    if stop_event and stop_event.is_set():
+                        print(f"🛑 Cancellation detected in _stream_with_retry for {thread_id}")
+                        # NEW: Explicitly assassinate the LangGraph generator
+                        stream_iter.close()
+                        return
+
+                    last_successful_chunk = chunk
+                    yield chunk
+                return  # Stream completed successfully
+            finally:
+                # NEW: Ensure it ALWAYS gets killed if the loop exits
+                stream_iter.close()
 
         except Exception as e:
             error_msg = str(e)
-            if _is_transient_error(error_msg) and attempt < _MAX_STREAM_RETRIES:
+            error_type = type(e).__name__
+            
+            # Check if this is a transient error worth retrying
+            is_transient = _is_transient_error(error_msg)
+            
+            # Also check for specific exception types
+            is_ssl_error = 'ssl' in error_type.lower() or 'ssl' in error_msg.lower()
+            is_connection_error = 'connection' in error_type.lower() or 'connection' in error_msg.lower()
+            
+            should_retry = (is_transient or is_ssl_error or is_connection_error) and attempt < _MAX_STREAM_RETRIES
+            
+            if should_retry:
                 attempt += 1
-                print(f"🔄 Stream retry {attempt}/{_MAX_STREAM_RETRIES} for thread {thread_id}: {error_msg}")
+                delay = min(_SSL_RETRY_BASE_DELAY * (2 ** (attempt - 1)), 15)  # Exponential backoff, max 15s
                 
-                # Fully reset the checkpointer pool — the SSL connection is dead.
-                # A simple health check is not enough; the dead connection may be
-                # the one LangGraph's PostgresSaver uses internally.
+                print(f"🔄 Stream retry {attempt}/{_MAX_STREAM_RETRIES} for thread {thread_id}")
+                print(f"   Error: {error_type}: {error_msg[:100]}...")
+                print(f"   Waiting {delay}s before retry...")
+                
+                # Attempt checkpointer recovery
+                _recover_checkpointer(agent)
+                
+                # Also reset the CRUD pool if needed
                 try:
-                    from database import reset_checkpointer_pool, _checkpointer_pool, get_checkpointer
-                    reset_checkpointer_pool()
-                    
-                    # Reinitialize the checkpointer with the fresh pool
-                    new_checkpointer = get_checkpointer()
-                    
-                    # Update the agent's checkpointer so retries use the fresh pool
-                    # LangGraph compiled graphs store checkpointer internally
-                    if hasattr(agent, 'checkpointer'):
-                        agent.checkpointer = new_checkpointer
-                    
-                    print(f"   ✅ Checkpointer fully reset and reinitialized")
-                except Exception as pool_err:
-                    print(f"   ⚠️ Checkpointer pool reset failed: {pool_err}")
+                    ensure_healthy_pool()
+                except Exception:
+                    pass
                 
-                time.sleep(min(3 * attempt, 10))
+                time.sleep(delay)
 
-                # Notify frontend
+                # Notify frontend about the retry
                 store_event({'type': 'content', 'messages': [{
                     'role': 'assistant',
-                    'content': '\n\n> ⚠️ Database connection interrupted. Reconnecting...\n\n'
+                    'content': f'\n\n> ⚠️ Connection interrupted (attempt {attempt}/{_MAX_STREAM_RETRIES}). Reconnecting...\n\n'
                 }]})
 
                 # Resume from last checkpoint — don't re-send user message
@@ -1390,6 +1892,10 @@ def _stream_with_retry(agent, stream_input, config, thread_id, store_event):
                 continue
 
             raise  # Non-transient or retries exhausted — propagate to caller
+
+
+# SSL keepalive interval for long-running streams
+_SSL_KEEPALIVE_INTERVAL = 30  # Check SSL health every 30 seconds during streaming
 
 
 def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_research: bool, literature_survey: bool = False, persona: str = "default", edit_metadata: Optional[dict] = None, sites: Optional[list[str]] = None, user_id: Optional[str] = None):
@@ -1413,50 +1919,194 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
     import hashlib
     event_counter = 0
     active_tools = set()  # Track active tools to send completion events
+    active_tool_ids = {}  # NEW: Map tool_call_id to display_name
     sent_content_hashes = set()  # Track content already sent to prevent duplicates
+    last_ssl_check = time.time()  # Track last SSL health check
     
-    # Mapping of tool/agent names to user-friendly status messages
+    # =====================================================
+    # ENHANCED STATUS MESSAGES FOR UI DISPLAY
+    # These provide clear, user-friendly feedback during deep research
+    # =====================================================
+    
+    # Research phases for deep search mode
+    RESEARCH_PHASES = {
+        'planning': {'name': 'Planning', 'icon': '📋', 'description': 'Creating research plan'},
+        'searching': {'name': 'Searching', 'icon': '🔍', 'description': 'Gathering information'},
+        'drafting': {'name': 'Drafting', 'icon': '✍️', 'description': 'Writing content'},
+        'reasoning': {'name': 'Reasoning', 'icon': '🧠', 'description': 'Deep reasoning & verification'},
+        'finalizing': {'name': 'Finalizing', 'icon': '✨', 'description': 'Completing research'},
+    }
+    
+    # Mapping of tool/agent names to user-friendly status messages with detailed info
     TOOL_STATUS_MESSAGES = {
-        # Subagents (called via 'task' tool)
-        'write_todos': {'start': '📅 Planning research...', 'complete': 'Plan created'},
-        'github-agent': {'start': '🐙 Analyzing GitHub repo...', 'complete': 'Repo analysis complete'},
-        'websearch-agent': {'start': '🌐 Searching the web...', 'complete': 'Web search complete'},
-        'academic-paper-agent': {'start': '📚 Searching for research papers...', 'complete': 'Paper search complete'},
-        'draft-subagent': {'start': '✍️ Drafting results...', 'complete': 'Draft complete'},
-        'deep-reasoning-agent': {'start': '🧠 Deep verification...', 'complete': 'Verification complete'},
-        'summary-subagent': {'start': '📝 Summarizing findings...', 'complete': 'Summary complete'},
-        'report-subagent': {'start': '📄 Generating report...', 'complete': 'Report generated'},
-        # Direct tools
-        'internet_search': {'start': '🔍 Performing web search...', 'complete': 'Search complete'},
-        'arxiv_search': {'start': '📖 Searching arXiv papers...', 'complete': 'arXiv search complete'},
-        'export_to_pdf': {'start': '📑 Exporting to PDF...', 'complete': 'PDF exported'},
-        'export_to_docx': {'start': '📝 Exporting to DOCX...', 'complete': 'DOCX exported'},
-        'extract_content': {'start': '📄 Extracting content...', 'complete': 'Content extracted'},
-        'literature-survey-agent': {'start': '📚 Conducting literature survey...', 'complete': 'Literature survey complete'},
-        # LaTeX conversion tools
-        'convert_latex_to_pdf': {'start': '📑 Converting to PDF...', 'complete': 'PDF conversion complete'},
-        'convert_latex_to_docx': {'start': '📝 Converting to DOCX...', 'complete': 'DOCX conversion complete'},
-        'convert_latex_to_markdown': {'start': '📄 Converting to Markdown...', 'complete': 'Markdown conversion complete'},
-        'convert_latex_to_all_formats': {'start': '📚 Converting to all formats...', 'complete': 'Conversions complete'},
-        'generate_and_convert_document': {'start': '📝 Generating document...', 'complete': 'Document generated'},
-        'generate_large_document_with_chunks': {'start': '📚 Generating large document...', 'complete': 'Document generated'},
-        'search_knowledge_base': {'start': '🔍 Searching uploaded documents...', 'complete': 'Document search complete'},
+        # ===== SUBAGENTS (Deep Research Pipeline) =====
+        'write_todos': {
+            'start': '📋 Updating research plan...',
+            'complete': 'Research plan updated',
+            'phase': 'planning',
+            'detail': 'Managing research steps and progress'
+        },
+        'websearch-agent': {
+            'start': '🌐 Searching the web...',
+            'complete': 'Web search complete',
+            'phase': 'searching',
+            'next_phase': 'drafting',
+            'detail': 'Gathering info from web & academic sources'
+        },
+        'github-agent': {
+            'start': '🐙 Analyzing GitHub repository...',
+            'complete': 'Repository analysis complete',
+            'phase': 'searching',
+            'detail': 'Examining code, issues, and documentation'
+        },
+        'draft-subagent': {
+            'start': '✍️ Drafting response...',
+            'complete': 'Draft complete',
+            'phase': 'drafting',
+            'next_phase': 'reasoning',
+            'detail': 'Synthesizing findings into a comprehensive answer'
+        },
+        'deep-reasoning-agent': {
+            'start': '🧠 Verifying and reasoning...',
+            'complete': 'Verification complete',
+            'phase': 'reasoning',
+            'next_phase': 'finalizing',
+            'detail': 'Cross-checking facts and validating conclusions'
+        },
+        'summary-agent': {
+            'start': '📝 Summarizing findings...',
+            'complete': 'Summary complete',
+            'phase': 'finalizing',
+            'next_phase': 'completed',
+            'detail': 'Creating a concise summary of the research'
+        },
+        'report-subagent': {
+            'start': '📄 Generating final report...',
+            'complete': 'Report generated',
+            'phase': 'finalizing',
+            'next_phase': 'completed',
+            'detail': 'Compiling all findings into a structured report'
+        },
+        'literature-survey-agent': {
+            'start': '📚 Conducting literature survey...',
+            'complete': 'Literature survey complete',
+            'phase': 'searching',
+            'detail': 'Systematically reviewing academic literature'
+        },
+        
+        # ===== DIRECT TOOLS =====
+        'internet_search': {
+            'start': '🔍 Searching the internet...',
+            'complete': 'Search complete',
+            'phase': 'searching',
+            'detail': 'Querying search engines for relevant results'
+        },
+        'arxiv_search': {
+            'start': '📖 Searching arXiv...',
+            'complete': 'arXiv search complete',
+            'phase': 'searching',
+            'detail': 'Finding preprints and research papers'
+        },
+        'search_knowledge_base': {
+            'start': '📂 Searching your documents...',
+            'complete': 'Document search complete',
+            'phase': 'searching',
+            'detail': 'Looking through your uploaded files'
+        },
+        'extract_content': {
+            'start': '📄 Extracting content...',
+            'complete': 'Content extracted',
+            'phase': 'searching',
+            'detail': 'Reading and parsing document content'
+        },
+        
+        # ===== EXPORT/CONVERSION TOOLS =====
+        'export_to_pdf': {
+            'start': '📑 Creating PDF...',
+            'complete': 'PDF ready',
+            'phase': 'finalizing',
+            'detail': 'Converting to PDF format'
+        },
+        'export_to_docx': {
+            'start': '📝 Creating Word document...',
+            'complete': 'Document ready',
+            'phase': 'finalizing',
+            'detail': 'Converting to DOCX format'
+        },
+        'convert_latex_to_pdf': {
+            'start': '📑 Converting LaTeX to PDF...',
+            'complete': 'PDF conversion complete',
+            'phase': 'finalizing',
+            'detail': 'Rendering LaTeX document'
+        },
+        'convert_latex_to_docx': {
+            'start': '📝 Converting to Word...',
+            'complete': 'Word document ready',
+            'phase': 'finalizing',
+            'detail': 'Converting LaTeX to DOCX'
+        },
+        'convert_latex_to_markdown': {
+            'start': '📄 Converting to Markdown...',
+            'complete': 'Markdown ready',
+            'phase': 'finalizing',
+            'detail': 'Converting LaTeX to Markdown'
+        },
+        'convert_latex_to_all_formats': {
+            'start': '📚 Exporting all formats...',
+            'complete': 'All formats ready',
+            'phase': 'finalizing',
+            'detail': 'Creating PDF, DOCX, and Markdown versions'
+        },
+        'generate_and_convert_document': {
+            'start': '📝 Generating document...',
+            'complete': 'Document generated',
+            'phase': 'drafting',
+            'detail': 'Creating formatted document'
+        },
+        'generate_large_document_with_chunks': {
+            'start': '📚 Generating large document...',
+            'complete': 'Document generated',
+            'phase': 'drafting',
+            'detail': 'Creating comprehensive document in sections'
+        },
     }
     
-    # Progress mapping (0-100)
+    # Progress mapping (0-100) - represents overall research progress
     TOOL_PROGRESS = {
+        # Planning phase (0-15%)
         'write_todos': 10,
-        'github-agent': 15,
-        'search_knowledge_base': 15,
-        'websearch-agent': 30,
-        'academic-paper-agent': 40,
-        'draft-subagent': 60,
-        'deep-reasoning-agent': 75,
-        'summary-subagent': 90,
-        'report-subagent': 95,
-        'literature-survey-agent': 50,
+        
+        # Searching phase (15-50%)
+        'search_knowledge_base': 20,
         'internet_search': 25,
+        'arxiv_search': 30,
+        'websearch-agent': 40,
+        'github-agent': 45,
+        'literature-survey-agent': 50,
+        
+        # Drafting phase (50-75%)
+        'draft-subagent': 65,
+        'generate_and_convert_document': 70,
+        'generate_large_document_with_chunks': 70,
+        
+        # Reasoning phase (75-90%)
+        'deep-reasoning-agent': 85,
+        
+        # Finalizing phase (90-100%)
+        'summary-agent': 90,
+        'report-subagent': 92,
+        'export_to_pdf': 95,
+        'export_to_docx': 95,
+        'convert_latex_to_pdf': 96,
+        'convert_latex_to_docx': 96,
+        'convert_latex_to_markdown': 96,
+        'convert_latex_to_all_formats': 98,
     }
+    
+    # Track current research phase
+    current_phase = 'planning' if deep_research else None
+    phase_start_time = time.time()
+    last_sent_progress = 0
     
     def store_event(event_data: dict):
         """Store event in session buffer and push to queue"""
@@ -1464,13 +2114,7 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
         event_counter += 1
         event_data['event_id'] = f'{thread_id}_{event_counter}'
         
-        if thread_id in active_sessions:
-            active_sessions[thread_id]["events"].append(event_data)
-            # Update last content if it's a content update
-            if event_data.get("messages"):
-                for msg in event_data["messages"]:
-                    if msg.get("content"):
-                        active_sessions[thread_id]["last_content"] = msg["content"]
+        append_event(thread_id, event_data)
         
         # Push to queue for any connected clients
         if thread_id in message_queues:
@@ -1479,29 +2123,236 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
             except queue.Full:
                 pass  # Queue full, event is still stored in buffer
     
-    def get_status_message(tool_name: str, step: str) -> str:
-        """Get user-friendly status message for a tool"""
+    def get_status_message(tool_name: str, step: str) -> dict:
+        """
+        Get user-friendly status message and metadata for a tool.
+        Returns a dict with message, phase, detail, and icon for rich UI display.
+        """
         if tool_name in TOOL_STATUS_MESSAGES:
-            return TOOL_STATUS_MESSAGES[tool_name].get(step, f'{tool_name}...')
-        return f'Running {tool_name}...' if step == 'start' else f'Finished {tool_name}'
+            tool_info = TOOL_STATUS_MESSAGES[tool_name]
+            return {
+                'message': tool_info.get(step, f'{tool_name}...'),
+                'phase': tool_info.get('phase', 'processing'),
+                'detail': tool_info.get('detail', ''),
+                'icon': RESEARCH_PHASES.get(tool_info.get('phase', ''), {}).get('icon', '⚙️')
+            }
+        
+        # Default fallback logic for unknown tools/agents
+        display_label = tool_name.replace("-", " ").replace("_", " ").title()
+        
+        # NEW: Smart phase guessing so UI doesn't get stuck!
+        guessed_phase = 'searching'
+        lower_name = tool_name.lower()
+        if any(w in lower_name for w in ['draft', 'write', 'generate', 'document']):
+            guessed_phase = 'drafting'
+        elif any(w in lower_name for w in ['reason', 'think', 'verify', 'check']):
+            guessed_phase = 'reasoning'
+        elif any(w in lower_name for w in ['report', 'summary', 'export', 'final', 'pdf', 'docx']):
+            guessed_phase = 'finalizing'
+            
+        return {
+            'message': f'Running {display_label}...' if step == 'start' else f'Finished {display_label}',
+            'phase': guessed_phase,
+            'detail': 'Agent is performing a specialized task',
+            'icon': '⚙️'
+        }
+    
+    def send_phase_update(new_phase: str):
+        """Send a phase change event to the UI."""
+        nonlocal current_phase, phase_start_time
+        
+        if new_phase != current_phase and new_phase in RESEARCH_PHASES:
+            # Prevent regression: don't go back to earlier phases
+            # This handles cases where tools like 'write_todos' (planning) are used 
+            # during later phases for updates, which shouldn't reset the UI phase.
+            phase_keys = list(RESEARCH_PHASES.keys())
+            try:
+                current_idx = phase_keys.index(current_phase) if current_phase in phase_keys else -1
+                new_idx = phase_keys.index(new_phase)
+                
+                if new_idx < current_idx:
+                    # logger.debug(f"  Start of phase '{new_phase}' ignored because we are already in '{current_phase}'")
+                    return
+            except ValueError:
+                pass
+
+            # Calculate time spent in previous phase
+            phase_duration = time.time() - phase_start_time
+            
+            current_phase = new_phase
+            phase_start_time = time.time()
+            phase_info = RESEARCH_PHASES[new_phase]
+            
+            phase_event = {
+                'type': 'phase',
+                'phase': new_phase,
+                'name': phase_info['name'],
+                'icon': phase_info['icon'],
+                'description': phase_info['description']
+            }
+            store_event(phase_event)
+            logger.info(f"  🏁 Phase: {phase_info['icon']} {phase_info['name']}")
+            narrator.on_phase(new_phase)
+    
+    def extract_thinking(content: str) -> tuple:
+        """
+        Extract thinking/reasoning blocks from content.
+        Returns (thinking_content, cleaned_content)
+        """
+        thinking_content = None
+        cleaned_content = content
+        
+        # Handle <think> tags
+        think_match = re.search(r'<think>(.*?)</think>', content, re.DOTALL)
+        if think_match:
+            thinking_content = think_match.group(1).strip()
+            cleaned_content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+        
+        # Handle <thinking> tags (alternative format)
+        thinking_match = re.search(r'<thinking>(.*?)</thinking>', content, re.DOTALL)
+        if thinking_match:
+            thinking_content = thinking_match.group(1).strip()
+            cleaned_content = re.sub(r'<thinking>.*?</thinking>', '', cleaned_content, flags=re.DOTALL).strip()
+        
+        # Handle Claude-style reasoning (lines starting with "Thinking:" or "Reasoning:")
+        reasoning_match = re.search(r'^(Thinking:|Reasoning:)\s*(.+?)(?=\n\n|$)', content, re.MULTILINE | re.DOTALL)
+        if reasoning_match and not thinking_content:
+            thinking_content = reasoning_match.group(2).strip()
+            cleaned_content = re.sub(r'^(Thinking:|Reasoning:)\s*.+?(?=\n\n|$)', '', cleaned_content, flags=re.MULTILINE | re.DOTALL).strip()
+        
+        return thinking_content, cleaned_content
+
+    # ─── Synthetic Thinking Narrator ──────────────────────────────────────────
+    # Gemini doesn't emit <think> tags, so we synthesise a rich, contextual
+    # reasoning trace from agent actions and emit it as 'thinking' SSE events.
+    # This powers the ReasoningBlock for ALL queries, not just deep-research.
+    # ──────────────────────────────────────────────────────────────────────────
+
+    class ThinkingNarrator:
+        TOOL_NARRATIVES = {
+            # Web / Search
+            'internet_search':        ("🔍 Searching the web",              "Querying search engines for relevant, up-to-date information on this topic."),
+            'web_search':             ("🌐 Web search",                     "Retrieving and scanning recent web results to gather factual context."),
+            'extract_content':        ("📄 Reading page content",           "Extracting and parsing the full text from relevant web pages."),
+            # Arxiv / Academic
+            'arxiv_search':           ("📚 Searching arXiv",                "Querying the arXiv preprint database for peer-reviewed academic papers."),
+            'academic-paper-agent':   ("🎓 Academic literature scan",       "Searching and summarising relevant academic papers and research findings."),
+            'paper_reader':           ("📖 Reading paper",                  "Parsing the full text of academic papers to extract key findings and methods."),
+            # Reasoning / Drafting
+            'deep-reasoning-agent':   ("🧠 Deep reasoning pass",            "Performing a thorough cross-verification and logical analysis of the gathered evidence."),
+            'draft-subagent':         ("✍️  Drafting response",              "Structuring and composing a well-organised, evidence-backed answer."),
+            'websearch-agent':        ("🔎 Comprehensive web research",     "Running parallel searches across multiple sources to build a complete picture."),
+            # Reports / Export
+            'report-subagent':        ("📝 Generating report",              "Compiling all findings into a structured, formatted research document."),
+            'summary-agent':          ("📋 Summarising findings",           "Distilling the most important insights from the collected research."),
+            'export_to_pdf':          ("📄 Exporting to PDF",               "Converting the completed report into a downloadable PDF file."),
+            'export_to_docx':         ("📝 Exporting to DOCX",              "Converting the completed report into a downloadable Word document."),
+            # Verification
+            'validate_citations':     ("✅ Validating citations",           "Cross-checking all cited sources for accuracy and accessibility."),
+            'fact_check_claims':      ("🔬 Fact-checking claims",           "Verifying factual statements against authoritative sources."),
+            'assess_content_quality': ("📊 Assessing quality",              "Evaluating response completeness, coherence, and factual integrity."),
+            # GitHub / Code
+            'github-agent':           ("💻 Searching GitHub",               "Looking through code repositories and technical documentation on GitHub."),
+        }
+        PHASE_NARRATIVES = {
+            'planning':   "Step 1: Planning — analysing the query and deciding which research strategies to employ.",
+            'searching':  "Step 2: Searching — dispatching queries across web, academic, and specialised sources.",
+            'analyzing':  "Step 3: Analysing — reading, cross-referencing, and synthesising the retrieved material.",
+            'drafting':   "Step 4: Drafting — composing a structured, evidence-backed response.",
+            'reasoning':  "Step 5: Reasoning — verifying facts, checking citations, and stress-testing the draft.",
+            'finalizing': "Step 6: Finalising — polishing the response and preparing any downloadable outputs.",
+        }
+
+        def __init__(self):
+            self.step = 0
+            self.seen_tools: set = set()
+            self.last_tool_narrated: str = ""
+
+        def _emit(self, text: str, phase: str = ""):
+            self.step += 1
+            event = {'type': 'thinking', 'content': f"Step {self.step}: {text}\n", 'phase': phase or current_phase}
+            store_event(event)
+
+        def on_query_start(self, user_prompt: str, mode: str):
+            short = user_prompt[:120].replace('\n', ' ')
+            self._emit(f'Received query: "{short}"')
+            if mode == 'deep_research':
+                self._emit("Mode: Deep Research — will run multi-phase web + academic research pipeline.")
+            elif mode == 'literature_survey':
+                self._emit("Mode: Literature Survey — will search arXiv and academic sources exhaustively.")
+            else:
+                self._emit("Mode: Chat — will answer directly with supporting web research where needed.")
+
+        def on_phase(self, phase: str):
+            narrative = self.PHASE_NARRATIVES.get(phase)
+            if narrative:
+                self._emit(narrative, phase)
+
+        def on_tool_start(self, tool_name: str, tool_args: dict):
+            if tool_name in self.seen_tools:
+                return
+            self.seen_tools.add(tool_name)
+            label, detail = self.TOOL_NARRATIVES.get(
+                tool_name, (f"⚙️  Running {tool_name}", f"Invoking the {tool_name} tool to gather information.")
+            )
+            args_hint = ""
+            if isinstance(tool_args, dict):
+                q = tool_args.get('query') or tool_args.get('name') or tool_args.get('prompt') or tool_args.get('topic')
+                if q:
+                    args_hint = f' — query: "{str(q)[:80]}"'
+            self._emit(f"{label}{args_hint}. {detail}")
+
+        def on_tool_done(self, tool_name: str, result_chars: int):
+            label, _ = self.TOOL_NARRATIVES.get(tool_name, (tool_name, ""))
+            if result_chars > 0:
+                self._emit(f"{label} complete — retrieved {result_chars:,} characters of data.")
+
+        def on_content_start(self):
+            self._emit("Synthesising answer — weaving together all gathered evidence into a coherent response.")
+
+        def on_done(self):
+            self._emit("Response complete. All sources corroborated and answer finalised.")
+
+    narrator = ThinkingNarrator()
     
     try:
-        # Send init event
-        init_event = {'thread_id': thread_id, 'type': 'init'}
+        # Determine research mode for UI display
+        if literature_survey:
+            mode = 'literature_survey'
+            mode_display = 'Literature Survey'
+            mode_prefix = "[MODE: LITERATURE_SURVEY] "
+        elif deep_research:
+            mode = 'deep_research'
+            mode_display = 'Deep Research'
+            mode_prefix = "[MODE: DEEP_RESEARCH] "
+        else:
+            mode = 'chat'
+            mode_display = 'Chat'
+            mode_prefix = "[MODE: CHAT] "
+        
+        # Send enhanced init event with mode info for UI
+        init_event = {
+            'thread_id': thread_id,
+            'type': 'init',
+            'mode': mode,
+            'mode_display': mode_display,
+            'deep_research': deep_research,
+            'literature_survey': literature_survey,
+            'phases': list(RESEARCH_PHASES.keys()) if deep_research else None
+        }
         store_event(init_event)
+
+        # Kick off the narrator — emits initial thinking steps immediately
+        narrator.on_query_start(prompt, mode)
+
+        # Send initial phase if in deep research mode
+        if deep_research:
+            send_phase_update('planning')
+            narrator.on_phase('planning')
         
         # Buffer to hold download events - sent AFTER all content to keep summary + download in sync
         buffered_download_event = None
         download_marker_seen = False
-        
-        # Prefix message with mode indicator for agent routing
-        # Also include persona context
-        if literature_survey:
-            mode_prefix = "[MODE: LITERATURE_SURVEY] "
-        elif deep_research:
-            mode_prefix = "[MODE: DEEP_RESEARCH] "
-        else:
-            mode_prefix = "[MODE: CHAT] "
         
         # Add persona instruction - ALWAYS include it for agent awareness
         persona_instruction = ""
@@ -1512,7 +2363,7 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
         print(f"   🔍 Deep Research: {deep_research}")
         print(f"   📚 Literature Survey: {literature_survey}")
         
-        if not literature_survey:
+        if deep_research and not literature_survey:
             if persona_value == "student":
                 persona_instruction = "\n[PERSONA: STUDENT - Explain concepts simply, use analogies, be encouraging, avoid jargon]"
             elif persona_value == "professor":
@@ -1574,17 +2425,87 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
         message_input = HumanMessage(content=final_content)
         print(f"   📝 HumanMessage content preview: {message_input.content[:120] if isinstance(message_input.content, str) else str(message_input.content)[:120]}...")
         
-        # Stream agent updates with automatic retry on transient DB/SSL errors
-        for chunk in _stream_with_retry(
+        # ─── CANCELLATION-AWARE STREAMING ─────────────────────────────────────
+        # Run the LangGraph stream in a SEPARATE daemon thread so that the outer
+        # background thread can poll for cancellation every second instead of
+        # blocking indefinitely inside agent.stream() / a tool call.
+        #
+        # Architecture:
+        #   stream_thread  ──chunks──►  chunk_queue  ──►  outer loop (polls + checks cancel)
+        #
+        # Sentinel object placed in the queue when the stream_thread finishes.
+        # ──────────────────────────────────────────────────────────────────────
+        _STREAM_DONE = object()  # Unique sentinel
+        chunk_queue: queue.Queue = queue.Queue(maxsize=500)
+        stream_exception: list = []  # Mutable container so the inner thread can write
+
+        # Create / reset the per-thread cancellation Event
+        cancel_evt = threading.Event()
+        cancellation_events[thread_id] = cancel_evt
+
+        # 1. Assign the stream to a variable so we can control it
+        langgraph_stream = _stream_with_retry(
             agent,
             {"messages": [message_input]},
-            config, thread_id, store_event
-        ):
-            # CHECK FOR CANCELLATION at the start of each chunk
-            if thread_id in active_sessions and active_sessions[thread_id].get("cancelled"):
-                print(f"🛑 Cancellation detected for thread {thread_id}, stopping agent...")
+            config, thread_id, store_event,
+            stop_event=cancel_evt
+        )
+
+        def _stream_worker():
+            """Inner daemon thread: runs agent.stream() and puts chunks into chunk_queue."""
+            try:
+                for _chunk in langgraph_stream:
+                    chunk_queue.put(_chunk)
+            except (Exception, GeneratorExit) as _exc:
+                # GeneratorExit is handled by finally
+                if not isinstance(_exc, GeneratorExit):
+                    stream_exception.append(_exc)
+            finally:
+                langgraph_stream.close()
+                chunk_queue.put(_STREAM_DONE)
+
+        stream_thread = threading.Thread(target=_stream_worker, daemon=True)
+        stream_thread.start()
+
+        # Outer loop: read chunks from the queue with a 1-second timeout
+        # so we can check for cancellation between reads.
+        _cancelled = False
+        while True:
+            # Re-check whether cancel was already requested (dict flag, for compat)
+            if active_sessions.get(thread_id, {}).get("cancelled") or cancel_evt.is_set():
+                print(f"🛑 Cancellation detected for thread {thread_id}, abandoning stream...")
+                # NEW: Explicitly assassinate the LangGraph generator
+                langgraph_stream.close()
                 cancelled_event = {'type': 'cancelled', 'message': 'Generation stopped by user'}
                 store_event(cancelled_event)
+                _cancelled = True
+                break
+
+            try:
+                chunk = chunk_queue.get(timeout=1.0)
+            except queue.Empty:
+                # No chunk yet — check cancellation and loop
+                continue
+
+            if chunk is _STREAM_DONE:
+                # Stream finished normally (or with exception)
+                break
+
+            # ── re-inject the cancellation check that was previously inside the loop ──
+            if active_sessions.get(thread_id, {}).get("cancelled") or cancel_evt.is_set():
+                print(f"🛑 Cancellation detected for thread {thread_id}, abandoning stream...")
+                # NEW: Explicitly assassinate the LangGraph generator
+                langgraph_stream.close()
+                cancelled_event = {'type': 'cancelled', 'message': 'Generation stopped by user'}
+                store_event(cancelled_event)
+                _cancelled = True
+                break
+            
+            # CHECK FOR SERVER SHUTDOWN (uvicorn --reload)
+            if _shutting_down:
+                print(f"ℹ️ Server shutting down, stopping thread {thread_id}")
+                # NEW: Explicitly assassinate the LangGraph generator
+                langgraph_stream.close()
                 break
             
             # Process each node's output in the chunk
@@ -1616,31 +2537,95 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
                             for tool_call in msg.tool_calls:
                                 tool_name = tool_call.get("name", "") if isinstance(tool_call, dict) else getattr(tool_call, "name", "")
                                 tool_args = tool_call.get("args", {}) if isinstance(tool_call, dict) else getattr(tool_call, "args", {})
+                                tool_id = tool_call.get("id", "") if isinstance(tool_call, dict) else getattr(tool_call, "id", "") # NEW
                                 
-                                # If it's a subagent call via 'task' tool, get the actual agent name
-                                if tool_name == "task":
-                                    display_name = tool_args.get("name", "subagent") if isinstance(tool_args, dict) else "subagent"
+                                # Extract the true subagent name from generic tool wrappers
+                                if tool_name in ["task", "subagent", "delegate", "call_subagent"]:
+                                    # Fix: LangChain sometimes passes args as a raw JSON string
+                                    if isinstance(tool_args, str):
+                                        try:
+                                            import json as _json
+                                            tool_args = _json.loads(tool_args)
+                                        except:
+                                            pass
+                                            
+                                    if isinstance(tool_args, dict):
+                                        # Aggressively look for the real name across all possible keys
+                                        display_name = tool_args.get("subagent") or \
+                                                       tool_args.get("agent") or \
+                                                       tool_args.get("name") or \
+                                                       tool_args.get("agent_name") or \
+                                                       tool_args.get("tool") or \
+                                                       tool_args.get("action")
+                                        
+                                        # Ultimate fallback: check if any value matches a known tool
+                                        if not display_name:
+                                            for val in tool_args.values():
+                                                if isinstance(val, str) and val in TOOL_STATUS_MESSAGES:
+                                                    display_name = val
+                                                    break
+                                                    
+                                        display_name = display_name or "subagent"
+                                    else:
+                                        display_name = "subagent"
                                 else:
                                     display_name = tool_name
+                                
+                                # NEW: Save the ID mapping
+                                if tool_id:
+                                    active_tool_ids[tool_id] = display_name
                                 
                                 if display_name and display_name not in active_tools:
                                     active_tools.add(display_name)
                                     progress_val = TOOL_PROGRESS.get(display_name)
+                                    # LATCH: Progress only moves forward
+                                    if progress_val is not None:
+                                        last_sent_progress = max(last_sent_progress, progress_val)
                                     
+                                    status_info = get_status_message(display_name, 'start')
+                                    tool_phase = status_info.get('phase')
+                                    
+                                    # Update phase if needed (deep research mode)
+                                    if deep_research and tool_phase:
+                                        send_phase_update(tool_phase)
+                                    
+                                    # Use effective phase for UI to avoid visual regression
+                                    ui_phase = tool_phase or 'processing'
+                                    if deep_research and tool_phase and current_phase:
+                                        # Only override if tool_phase is effectively an earlier phase than current_phase
+                                        phase_keys = list(RESEARCH_PHASES.keys())
+                                        try:
+                                            if tool_phase in phase_keys and current_phase in phase_keys:
+                                                if phase_keys.index(tool_phase) < phase_keys.index(current_phase):
+                                                    ui_phase = current_phase
+                                        except ValueError:
+                                            pass
+
                                     status_event = {
                                         "type": "status",
                                         "step": "start",
                                         "agent": node_name,
                                         "tool": display_name,
-                                        "message": get_status_message(display_name, "start"),
-                                        "progress": progress_val
+                                        "message": status_info['message'],
+                                        "detail": status_info.get('detail', ''),
+                                        "phase": ui_phase,
+                                        "icon": status_info.get('icon', '⚙️'),
+                                        "progress": last_sent_progress
                                     }
                                     store_event(status_event)
-                                    print(f"  🔧 [{node_name}] Starting: {display_name}")
+                                    logger.info(f"  🔧 [{node_name}] {status_info['message']}")
+                                    # Emit narrator step for this tool
+                                    narrator.on_tool_start(display_name, tool_args)
                         
                         # 2. Detect TOOL COMPLETION - when tool returns result
                         msg_type = getattr(msg, "type", None) or (msg.get("type") if isinstance(msg, dict) else None)
                         msg_name = getattr(msg, "name", None) or (msg.get("name") if isinstance(msg, dict) else None)
+                        
+                        # NEW: Recover the real subagent name using the tool_call_id
+                        tool_id = getattr(msg, "tool_call_id", None) or (msg.get("tool_call_id") if isinstance(msg, dict) else None)
+                        if tool_id and tool_id in active_tool_ids:
+                            msg_name = active_tool_ids.pop(tool_id)
+
                         msg_content = getattr(msg, "content", None) or (msg.get("content") if isinstance(msg, dict) else None)
                         
                         # 2a. CRITICAL: Intercept download markers from ANY message type BEFORE they can be corrupted
@@ -1711,17 +2696,32 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
                                     except (json.JSONDecodeError, ValueError, IndexError) as e:
                                         print(f"  ⚠️ Failed to parse download marker: {e}")
                         
-                        if msg_type == "tool" and msg_name:
-                            if msg_name in active_tools:
+                        if msg_type == "tool":
+                            # Use msg_name (which was updated by tool_id logic above)
+                            if msg_name and msg_name in active_tools:
                                 active_tools.discard(msg_name)
+                                status_info = get_status_message(msg_name, 'complete')
                                 status_event = {
                                     "type": "status",
                                     "step": "complete",
                                     "tool": msg_name,
-                                    "message": get_status_message(msg_name, "complete")
+                                    "message": status_info['message'],
+                                    "phase": status_info.get('phase', 'processing'),
+                                    "icon": '✅',
+                                    "progress": last_sent_progress
                                 }
                                 store_event(status_event)
-                                print(f"  ✅ Tool complete: {msg_name}")
+                                
+                                # Advance phase if this was a phase-terminating subagent
+                                next_phase = TOOL_STATUS_MESSAGES.get(msg_name, {}).get('next_phase')
+                                if deep_research and next_phase:
+                                    send_phase_update(next_phase)
+                                logger.info(f"  ✅ {status_info['message']}")
+                                # Narrator: tool finished — report how much data it produced
+                                result_len = len(str(msg_content)) if msg_content else 0
+                                narrator.on_tool_done(msg_name, result_len)
+                            elif msg_name == "task":
+                                logger.warning(f"  ⚠️ Generic 'task' completion detected without successful ID mapping.")
             
                 # Also serialize and send the regular update
             serialized = _serialize_chunk(chunk)
@@ -1763,111 +2763,149 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
                         continue  # All messages were duplicates, skip this update
                     serialized['messages'] = deduped_messages
                 
-                # Check for reasoning/thinking blocks in content
+                # Check for reasoning/thinking blocks in content and extract them
                 if serialized.get('messages'):
-                    # Only check the last message for new reasoning to avoid reprocessing history
                     msgs = serialized['messages']
-                    # Process only the last message if it exists
                     msg_list_to_check = [msgs[-1]] if msgs else []
                     
                     for msg in msg_list_to_check:
                         content = msg.get('content', '')
-                        if isinstance(content, str) and '<think>' in content:
-                            # Extract and send reasoning separately
-                            think_match = re.search(r'<think>(.*?)</think>', content, re.DOTALL)
-                            if think_match:
-                                reasoning = think_match.group(1).strip()
-                                reasoning_event = {'type': 'reasoning', 'content': reasoning}
+                        if isinstance(content, str):
+                            # Use enhanced thinking extraction
+                            thinking_content, cleaned_content = extract_thinking(content)
+                            
+                            if thinking_content:
+                                # Send thinking/reasoning as separate event for UI display
+                                reasoning_event = {
+                                    'type': 'thinking',
+                                    'content': thinking_content,
+                                    'phase': current_phase
+                                }
                                 store_event(reasoning_event)
-                                # Clean the content
-                                msg['content'] = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+                                logger.debug(f"  💭 Thinking extracted ({len(thinking_content)} chars)")
+                            
+                            # Update message with cleaned content
+                            if cleaned_content != content:
+                                msg['content'] = cleaned_content
                 
                 store_event(serialized)
         
-        # Send buffered download event AFTER all content has been streamed
-        # This ensures the summary text arrives before the download button
-        # Collect ALL pending downloads (PDF, DOCX, LaTeX) - don't short-circuit!
-        from tools.pdftool import get_pending_download as get_pdf_download
-        from tools.doctool import get_pending_download as get_docx_download
-        from tools.latextoformate import get_pending_download as get_latex_download
+        # Re-raise any exception that occurred inside the stream_worker thread
+        if stream_exception:
+            raise stream_exception[0]
         
-        all_downloads = []
-        if buffered_download_event:
-            all_downloads.append(buffered_download_event)
-        
-        # Check each tool's storage independently (no short-circuit)
-        pdf_pending = get_pdf_download()
-        if pdf_pending and pdf_pending.get("data"):
-            all_downloads.append({
-                "type": "download",
-                "filename": pdf_pending.get("filename", "download.pdf"),
-                "data": pdf_pending.get("data", "")
-            })
-            print(f"  📥 PDF recovered from tool storage: {pdf_pending.get('filename')} ({len(pdf_pending.get('data', ''))} bytes)")
-        
-        docx_pending = get_docx_download()
-        if docx_pending and docx_pending.get("data"):
-            all_downloads.append({
-                "type": "download",
-                "filename": docx_pending.get("filename", "download.docx"),
-                "data": docx_pending.get("data", "")
-            })
-            print(f"  📥 DOCX recovered from tool storage: {docx_pending.get('filename')} ({len(docx_pending.get('data', ''))} bytes)")
-        
-        latex_pending = get_latex_download()
-        if latex_pending and latex_pending.get("data"):
-            all_downloads.append({
-                "type": "download",
-                "filename": latex_pending.get("filename", "download"),
-                "data": latex_pending.get("data", "")
-            })
-            print(f"  📥 LaTeX recovered from tool storage: {latex_pending.get('filename')} ({len(latex_pending.get('data', ''))} bytes)")
-        
-        if not all_downloads and download_marker_seen:
-            print(f"  ⚠️ Download marker was seen in stream but no data found in tool storage")
-            # Fallback: try Supabase in case tools uploaded there before SSL crash
-            try:
-                supabase_downloads = download_store.get_downloads_from_supabase(thread_id)
-                for sd in supabase_downloads:
-                    all_downloads.append({
-                        "type": "download",
-                        "filename": sd.get("filename", "download"),
-                        "data": sd.get("data", "")
-                    })
-                if supabase_downloads:
-                    print(f"  ☁️  Recovered {len(supabase_downloads)} download(s) from Supabase fallback")
-            except Exception as sb_err:
-                print(f"  ⚠️ Supabase fallback failed: {sb_err}")
-        
-        # Send all download events AND persist to Supabase for history reload
-        for download_event in all_downloads:
-            time.sleep(0.3)  # Small delay between downloads
-            store_event(download_event)
-            print(f"  📥 Download event sent: {download_event.get('filename')}")
-            # Persist to Supabase so reloads from history can retrieve the file
-            try:
-                download_store.save_to_supabase(
-                    thread_id,
-                    download_event.get("filename", "download"),
-                    download_event.get("data", "")
-                )
-            except Exception as save_err:
-                print(f"  ⚠️ Supabase persist failed (non-fatal): {save_err}")
-        
-        # Send completion event with final checkpoint ID
-        final_state = agent.get_state(config)
-        checkpoint_id = final_state.config["configurable"].get("checkpoint_id", "") if final_state else ""
-        done_event = {'type': 'done', 'checkpoint_id': checkpoint_id}
-        store_event(done_event)
-        
-        # Mark session as completed
-        if thread_id in active_sessions:
-            active_sessions[thread_id]["status"] = "completed"
-        
-        print(f"✅ Background thread completed for thread {thread_id}")
+        # If the session was cancelled, skip the download/done sending path
+        if _cancelled:
+            update_session_status(thread_id, "cancelled")
+            logger.info(f"🛑 Thread {thread_id} was cancelled by user.")
+
+        else:
+            # Send buffered download event AFTER all content has been streamed
+            # This ensures the summary text arrives before the download button
+            # Collect ALL pending downloads (PDF, DOCX, LaTeX) - don't short-circuit!
+            from tools.pdftool import get_pending_download as get_pdf_download
+            from tools.doctool import get_pending_download as get_docx_download
+            from tools.latextoformate import get_pending_download as get_latex_download
+            
+            all_downloads = []
+            if buffered_download_event:
+                all_downloads.append(buffered_download_event)
+            
+            # Check each tool's storage independently (no short-circuit)
+            pdf_pending = get_pdf_download()
+            if pdf_pending and pdf_pending.get("data"):
+                all_downloads.append({
+                    "type": "download",
+                    "filename": pdf_pending.get("filename", "download.pdf"),
+                    "data": pdf_pending.get("data", "")
+                })
+                print(f"  📥 PDF recovered from tool storage: {pdf_pending.get('filename')} ({len(pdf_pending.get('data', ''))} bytes)")
+            
+            docx_pending = get_docx_download()
+            if docx_pending and docx_pending.get("data"):
+                all_downloads.append({
+                    "type": "download",
+                    "filename": docx_pending.get("filename", "download.docx"),
+                    "data": docx_pending.get("data", "")
+                })
+                print(f"  📥 DOCX recovered from tool storage: {docx_pending.get('filename')} ({len(docx_pending.get('data', ''))} bytes)")
+            
+            latex_pending = get_latex_download()
+            if latex_pending and latex_pending.get("data"):
+                all_downloads.append({
+                    "type": "download",
+                    "filename": latex_pending.get("filename", "download"),
+                    "data": latex_pending.get("data", "")
+                })
+                print(f"  📥 LaTeX recovered from tool storage: {latex_pending.get('filename')} ({len(latex_pending.get('data', ''))} bytes)")
+            
+            if not all_downloads and download_marker_seen:
+                print(f"  ⚠️ Download marker was seen in stream but no data found in tool storage")
+                # Fallback: try Supabase in case tools uploaded there before SSL crash
+                try:
+                    supabase_downloads = download_store.get_downloads_from_supabase(thread_id)
+                    for sd in supabase_downloads:
+                        all_downloads.append({
+                            "type": "download",
+                            "filename": sd.get("filename", "download"),
+                            "data": sd.get("data", "")
+                        })
+                    if supabase_downloads:
+                        print(f"  ☁️  Recovered {len(supabase_downloads)} download(s) from Supabase fallback")
+                except Exception as sb_err:
+                    print(f"  ⚠️ Supabase fallback failed: {sb_err}")
+            
+            # Send all download events AND persist to Supabase for history reload
+            for download_event in all_downloads:
+                time.sleep(0.3)  # Small delay between downloads
+                store_event(download_event)
+                print(f"  📥 Download event sent: {download_event.get('filename')}")
+                # Persist to Supabase so reloads from history can retrieve the file
+                try:
+                    download_store.save_to_supabase(
+                        thread_id,
+                        download_event.get("filename", "download"),
+                        download_event.get("data", "")
+                    )
+                except Exception as save_err:
+                    print(f"  ⚠️ Supabase persist failed (non-fatal): {save_err}")
+            
+            # Send final phase update if in deep research mode
+            if deep_research:
+                send_phase_update('finalizing')
+            
+            # Calculate total processing time
+            total_time = time.time() - phase_start_time if phase_start_time else 0
+            
+            # Send completion event with final checkpoint ID and stats
+            final_state = agent.get_state(config)
+            checkpoint_id = final_state.config["configurable"].get("checkpoint_id", "") if final_state else ""
+            # Narrator: wrap up the thinking trace before sending done
+            narrator.on_content_start()
+            narrator.on_done()
+
+            done_event = {
+                'type': 'done',
+                'checkpoint_id': checkpoint_id,
+                'mode': mode if 'mode' in dir() else 'chat',
+                'duration_seconds': round(total_time, 2),
+                'downloads_count': len(all_downloads) if 'all_downloads' in dir() else 0
+            }
+            store_event(done_event)
+            
+            # Mark session as completed
+            update_session_status(thread_id, "completed", {"completed_at": datetime.now().isoformat()})
+            
+            logger.info(f"✅ Completed thread {thread_id} in {total_time:.1f}s")
         
     except Exception as e:
         error_message = str(e)
+        
+        # If server is shutting down (uvicorn --reload), pool-closed errors are expected — exit silently
+        if _shutting_down and ("pool" in error_message.lower() and "closed" in error_message.lower()):
+            print(f"ℹ️ Thread {thread_id} stopping due to server shutdown (pool closed)")
+            return
+        
         print(f"❌ Background thread error for thread {thread_id}: {error_message}")
         
         # Check if it's a Google API server error (transient 500)
@@ -1900,8 +2938,7 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
         error_event = {'type': 'error', 'error': error_message}
         store_event(error_event)
         
-        if thread_id in active_sessions:
-            active_sessions[thread_id]["status"] = "error"
+        update_session_status(thread_id, "error")
         
         # Last-resort: try to salvage any pending downloads to Supabase
         # so they aren't lost after all retries fail
@@ -1921,9 +2958,11 @@ def run_agent_background(agent, thread_id: str, prompt: str, config: dict, deep_
         except Exception as salvage_err:
             print(f"  ⚠️ Download salvage failed: {salvage_err}")
     finally:
-        # Cleanup: Remove thread reference
+        # Cleanup: Remove thread reference and cancellation event
         if thread_id in background_threads:
             del background_threads[thread_id]
+        if thread_id in cancellation_events:
+            del cancellation_events[thread_id]
         # Don't delete the queue immediately - clients may still be reading
 
 
@@ -1934,11 +2973,15 @@ def run_agent(request: AgentRequest, http_request: Request):
     The agent continues running even if the browser disconnects.
     Returns immediately with thread_id, then client subscribes to /threads/{id}/stream.
     """
+    # Periodic session cleanup (non-blocking)
+    cleanup_old_sessions()
+    
+    # Validation is handled by Pydantic validators
     if not request.prompt:
         raise HTTPException(status_code=400, detail="Prompt is required")
 
-    # Get agent from app state
-    agent = http_request.app.state.agent
+    # Get agent from app state (Fix 2: use refreshable instance)
+    agent = get_or_refresh_agent()
 
     # Get or create thread
     thread_id = request.thread_id
@@ -1966,7 +3009,8 @@ def run_agent(request: AgentRequest, http_request: Request):
             )
     
     # Check if a thread is already running for this thread
-    if thread_id in active_sessions and active_sessions[thread_id].get("status") == "running":
+    current_status = get_session_status(thread_id)
+    if current_status == "running":
         # Return existing session info - client should subscribe to stream
         return StreamingResponse(
             iter([f"data: {json.dumps({'type': 'init', 'thread_id': thread_id, 'status': 'already_running'})}\n\n"]),
@@ -1993,13 +3037,13 @@ def run_agent(request: AgentRequest, http_request: Request):
     # Configure agent with thread_id and user_id for persistent state + multi-tenant RAG
     config = {
         "configurable": {"thread_id": thread_id, "user_id": request.user_id or ""},
-        "recursion_limit": 50  # Hard cap on agent steps to prevent infinite loops
+        "recursion_limit": 100  # Hard cap on agent steps to prevent infinite loops
     }
     if request.parent_checkpoint_id:
         config["configurable"]["checkpoint_id"] = request.parent_checkpoint_id
 
     # Initialize session tracking
-    active_sessions[thread_id] = {
+    init_session(thread_id, {
         "status": "running",
         "events": [],
         "last_content": "",
@@ -2008,7 +3052,7 @@ def run_agent(request: AgentRequest, http_request: Request):
         "literature_survey": request.literature_survey,
         "sites": request.sites or [],
         "started_at": datetime.now().isoformat()
-    }
+    })
     
     # Create message queue for this session
     message_queues[thread_id] = queue.Queue(maxsize=1000)
@@ -2052,7 +3096,7 @@ def run_agent(request: AgentRequest, http_request: Request):
                         break
                 except queue.Empty:
                     # Check session status directly if queue is quiet
-                    status = active_sessions.get(thread_id, {}).get("status")
+                    status = get_session_status(thread_id)
                     if status in ("completed", "error", "cancelled"):
                         break
                     

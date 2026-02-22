@@ -9,43 +9,33 @@ load_dotenv()
 latex_model = ChatGroq(model="openai/gpt-oss-120b", temperature=0.7)
 # Create prompt for LaTeX generation
 latex_prompt = ChatPromptTemplate.from_template(
-    """Generate a complete LaTeX document about: {topic}
+    """Generate a comprehensive, academic LaTeX-formatted document about: {topic}
 
-Requirements:
-- Include proper document structure with \\documentclass{{article}}, \\begin{{document}}, \\end{{document}}
-- Add required packages: \\usepackage{{booktabs, float, hyperref, geometry, amsmath, amssymb, array, tabularx}}
-- Set proper margins: \\geometry{{margin=1in}}
-- Add ONLY the title (derived from the topic) and date (\\today) - DO NOT add any author or subtitle
-- Use \\maketitle for proper title formatting
-- Include sections and subsections with descriptive headings
-- DO NOT include any subtitle, author name, or agent attribution in the document
-- DO NOT include any images or figures in the document
+CRITICAL STRUCTURE REQUIREMENTS:
+- DO NOT include \\documentclass, \\usepackage, \\begin{{document}}, or \\end{{document}}.
+- DO NOT use \\maketitle. 
+- Output ONLY the raw document body (sections, content, tables, equations). 
+- The backend system will automatically handle the LaTeX preamble, title page, date, and margins.
+- Start directly with your first \\section{{Introduction}} or abstract.
 
-TABLE FORMATTING (CRITICAL):
+TABLE FORMATTING:
 - Use tabularx for responsive tables: \\begin{{tabularx}}{{\\textwidth}}{{l X X X}} for flexible columns
-- OR use tabular with proper column widths: \\begin{{tabular}}{{p{{3cm}}p{{4cm}}p{{3cm}}p{{4cm}}}}
 - Always use booktabs: \\toprule, \\midrule, \\bottomrule
 - Wrap tables in \\begin{{table}}[H] with \\centering
 - Add \\caption and \\label for each table
 - Use \\renewcommand{{\\arraystretch}}{{1.3}} before tables for better row spacing
-- For long text in cells, use p{{Xcm}} column type instead of c or l
 
+CONTENT RULES:
+- Include sections and subsections with descriptive headings
+- DO NOT include any subtitle, author name, or agent attribution in the document
+- DO NOT include any images or figures in the document
 - Use proper text alignment and paragraph spacing
 - Include itemize/enumerate lists where appropriate
 - Add meaningful content (3-4 pages worth)
 - Use proper LaTeX formatting for emphasis (\\textbf{{}}, \\textit{{}}, \\emph{{}})
 - Include a bibliography or references section if applicable
 
-Document Structure:
-1. Title page (title and date ONLY - no author/subtitle)
-2. Abstract (brief summary)
-3. Introduction
-4. Main sections with subsections
-5. Tables with captions (NO images/figures)
-6. Conclusion
-7. References (if applicable)
-
-Return ONLY the LaTeX code, no explanations or markdown formatting."""
+Return ONLY the LaTeX code. No markdown code blocks, no explanations."""
 )
 
 # Create chain

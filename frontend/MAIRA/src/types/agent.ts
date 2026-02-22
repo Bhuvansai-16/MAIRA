@@ -103,8 +103,75 @@ export interface ContentBlock {
     metadata?: Record<string, any>;
 }
 
+// Research phases for deep search mode
+export type ResearchPhase = 'planning' | 'searching' | 'analyzing' | 'reasoning' | 'drafting' | 'finalizing';
+
+export interface PhaseInfo {
+    name: string;
+    icon: string;
+    description: string;
+}
+
+export const RESEARCH_PHASES: Record<ResearchPhase, PhaseInfo> = {
+    planning: { name: 'Planning', icon: '📋', description: 'Creating research plan' },
+    searching: { name: 'Searching', icon: '🔍', description: 'Gathering information' },
+    analyzing: { name: 'Analyzing', icon: '📊', description: 'Processing findings' },
+    reasoning: { name: 'Reasoning', icon: '🧠', description: 'Deep reasoning & verification' },
+    drafting: { name: 'Drafting', icon: '✍️', description: 'Writing content' },
+    finalizing: { name: 'Finalizing', icon: '✨', description: 'Completing research' },
+};
+
+// Enhanced status event with phase and detail info
+export interface StatusEvent {
+    type: 'status';
+    step: 'start' | 'complete';
+    tool: string;
+    agent?: string;
+    message: string;
+    detail?: string;
+    phase?: ResearchPhase;
+    icon?: string;
+    progress?: number;
+}
+
+// Phase change event
+export interface PhaseEvent {
+    type: 'phase';
+    phase: ResearchPhase;
+    name: string;
+    icon: string;
+    description: string;
+}
+
+// Thinking/reasoning event
+export interface ThinkingEvent {
+    type: 'thinking';
+    content: string;
+    phase?: ResearchPhase;
+}
+
+// Enhanced init event with mode info
+export interface InitEvent {
+    type: 'init';
+    thread_id: string;
+    mode: 'chat' | 'deep_research' | 'literature_survey';
+    mode_display: string;
+    deep_research: boolean;
+    literature_survey: boolean;
+    phases?: ResearchPhase[];
+}
+
+// Enhanced done event with stats
+export interface DoneEvent {
+    type: 'done';
+    checkpoint_id?: string;
+    mode?: string;
+    duration_seconds?: number;
+    downloads_count?: number;
+}
+
 export interface StreamEvent {
-    type: 'init' | 'reasoning' | 'text' | 'update' | 'verification' | 'done' | 'error';
+    type: 'init' | 'phase' | 'status' | 'thinking' | 'reasoning' | 'text' | 'update' | 'verification' | 'download' | 'done' | 'error' | 'cancelled';
     event_id?: string;
     thread_id?: string;
     checkpoint_id?: string;
@@ -112,4 +179,25 @@ export interface StreamEvent {
     messages?: AgentMessage[];
     data?: any;
     error?: string;
+    // Phase event fields
+    phase?: ResearchPhase;
+    name?: string;
+    icon?: string;
+    description?: string;
+    // Status event fields
+    step?: 'start' | 'complete';
+    tool?: string;
+    agent?: string;
+    message?: string;
+    detail?: string;
+    progress?: number;
+    // Init event fields
+    mode?: string;
+    mode_display?: string;
+    deep_research?: boolean;
+    literature_survey?: boolean;
+    phases?: ResearchPhase[];
+    // Done event fields
+    duration_seconds?: number;
+    downloads_count?: number;
 }

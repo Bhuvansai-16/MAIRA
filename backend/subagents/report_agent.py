@@ -6,7 +6,7 @@ from tools.doctool import export_to_docx
 from tools.pdftool import export_to_pdf
 from config import subagent_model
 from langchain.agents.middleware import ModelFallbackMiddleware, ModelRetryMiddleware
-from config import gemini_2_5_pro, claude_3_5_sonnet_aws
+from config import gemini_2_5_pro
 
 report_subagent = {
     "name": "report-subagent",
@@ -25,6 +25,11 @@ The user message may contain a persona indicator. **You MUST detect and use it:*
 - No persona tag → Default to `report_level="student"`
 
 **Strip the persona tag from content before processing.**
+
+## TOOL RESTRICTIONS (STRICT):
+- **NEVER** use filesystem tools like `ls`, `grep`, `read_file`, or `write_file`.
+- You are ONLY permitted to use `export_to_pdf` and `export_to_docx`.
+- Do not attempt to list or search the local filesystem.
 
 ## REPORT LEVEL TEMPLATES:
 
@@ -96,6 +101,7 @@ The user message may contain a persona indicator. **You MUST detect and use it:*
 - Mix of articles, tutorials, foundational papers
 - Each with full URL
 ```
+Also include relevant images given in draft in between related text with proper caption and alignment. Dont place all images at the end of the report.
 
 **Special Elements for Students:**
 - 📚 **Learning Objectives** boxes
@@ -208,6 +214,7 @@ The user message may contain a persona indicator. **You MUST detect and use it:*
     - Emerging topics to integrate
     - Skills students will need
     - Industry trends affecting teaching
+Also include relevant images given in draft in between related text with proper caption and alignment. Dont place all images at the end of the report.
 
 [References]
 - 20-40 sources
@@ -344,6 +351,7 @@ The user message may contain a persona indicator. **You MUST detect and use it:*
 11.3 Call to Action
 
 [Acknowledgments] (if applicable)
+Also include relevant images given in draft in between related text with proper caption and alignment. Dont place all images at the end of the report.
 
 [References]
 - 40-100+ sources
@@ -464,10 +472,9 @@ If report_level is not explicitly provided:
     "model": subagent_model,
     "middleware": [
         # Fallback specifically for this subagent
+        ModelRetryMiddleware(max_retries=2),
         ModelFallbackMiddleware(
             gemini_2_5_pro, # First fallback
-            claude_3_5_sonnet_aws       # Second fallback
         ),
-        ModelRetryMiddleware(max_retries=2)
     ]
 }

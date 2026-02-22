@@ -12,27 +12,51 @@ from pydantic import BaseModel, Field
 from langchain.tools import tool
 from langchain_core.runnables import RunnableConfig
 
-# Thread-safe storage for download data from subagent tool calls
-# Uses a global latest-download approach instead of thread IDs because
-# LangGraph runs tools via asyncio.run_in_executor() in a thread pool,
-# so the storing thread ID differs from the retrieving thread ID.
-_latest_download = None
+# Thread-safe storage for pending downloads indexed by filename
+_pending_downloads = {}
 _download_lock = threading.Lock()
 
 def _store_pending_download(data: dict):
-    """Store download data globally (latest wins)."""
-    global _latest_download
+    """Store download data globally (indexed by filename)."""
+    global _pending_downloads
     with _download_lock:
-        _latest_download = data
-        print(f"  💾 [doctool] Download stored in pending: {data.get('filename', 'unknown')}")
+        if filename := data.get('filename'):
+            _pending_downloads[filename] = data
+            print(f"  💾 [doctool] Download stored in pending: {filename}")
 
-def get_pending_download() -> dict | None:
-    """Retrieve and remove the latest pending download data."""
-    global _latest_download
+def clean_math_and_code(text):
+    """Clean LaTeX math symbols and delimiters for Word compatibility."""
+    if not text: return ""
+    # 1. Strip math delimiters like $ and $$
+    text = text.replace('$$', '')
+    text = re.sub(r'(?<!\\)\$([^\$]+)\$', r'\1', text)  # Removes inline $...$
+    text = text.replace(r'\$', '')
+    
+    # 2. Convert common LaTeX symbols to Unicode
+    math_replacements = {
+        r'\rightarrow': '→', r'\leftarrow': '←',
+        r'\Rightarrow': '⇒', r'\Leftarrow': '⇐',
+        r'\Lambda': 'Λ', r'\sigma': 'σ', r'\pm': '±',
+        r'\approx': '≈', r'\mu': 'μ', r'\pi': 'π',
+        r'\Delta': 'Δ', r'\times': '×', r'\leq': '≤',
+        r'\geq': '≥', r'\infty': '∞',
+        r'H_0': 'H₀', r'r_s': 'rₛ'
+    }
+    for old, new in math_replacements.items():
+        text = text.replace(old, new)
+    return text
+
+def get_pending_download(filename: str = None) -> dict | None:
+    """Retrieve and remove pending download data by filename."""
+    global _pending_downloads
     with _download_lock:
-        data = _latest_download
-        _latest_download = None
-        return data
+        if filename:
+            return _pending_downloads.pop(filename, None)
+        # Fallback to latest for legacy calls (if any)
+        if _pending_downloads:
+            latest_key = list(_pending_downloads.keys())[-1]
+            return _pending_downloads.pop(latest_key)
+        return None
 
 import requests
 from docx import Document
@@ -175,7 +199,7 @@ def add_table_to_doc(doc: Document, table_data: list[list[str]], report_level: s
     for row_idx, row in enumerate(table_data):
         for col_idx, cell_text in enumerate(row):
             cell = table.rows[row_idx].cells[col_idx]
-            cell.text = cell_text
+            cell.text = clean_math_and_code(cell_text)
             
             # Format header row
             if row_idx == 0:
@@ -252,7 +276,26 @@ def process_markdown_content(doc: Document, content: str, report_level: str):
                     i = j
                     continue
         
-        # Not a table - process as regular content
+        # Check for code blocks: ```something```
+        if line.startswith('```'):
+            j = i + 1
+            code_lines = []
+            while j < len(lines) and not lines[j].strip().startswith('```'):
+                code_lines.append(lines[j])
+                j += 1
+            
+            if code_lines:
+                # Add a specialized paragraph for code
+                para = doc.add_paragraph()
+                # Simple implementation: set font to Courier New for the whole paragraph
+                run = para.add_run('\n'.join(code_lines))
+                run.font.name = 'Courier New'
+                run.font.size = Pt(9)
+            
+            i = j + 1
+            continue
+        
+        # Not a table or code block - process as regular content
         if line:
             # Check for image markdown: ![caption](url)
             img_match = re.match(r'^!\[([^\]]*)\]\(([^\)]+)\)$', line)
@@ -261,7 +304,7 @@ def process_markdown_content(doc: Document, content: str, report_level: str):
                 img_url = img_match.group(2)
                 try:
                     # Download image from URL
-                    response = requests.get(img_url, timeout=15, headers={
+                    response = requests.get(img_url, timeout=5, headers={
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                     })
                     if response.status_code == 200:
@@ -317,38 +360,44 @@ def process_markdown_content(doc: Document, content: str, report_level: str):
 
 
 def add_formatted_text(paragraph, text: str):
-    """Add text with Markdown formatting (**bold**, *italic*) to a paragraph.
-    
-    Processes both bold and italic patterns together to handle cases where
-    they appear in any order throughout the text.
+    """Add text with Markdown formatting (**bold**, *italic*, `code`) to a paragraph.
+    Also cleans LaTeX math symbols.
     """
     import re
     
-    # Combined pattern: matches **bold** or *italic* (non-greedy)
-    # Process bold first to avoid confusion with italic markers
-    combined_pattern = r'(\*\*(.+?)\*\*|\*([^*]+?)\*)'
+    # Process math/LaTeX first
+    text = clean_math_and_code(text)
+    
+    # Combined pattern: matches **bold**, *italic*, or `code` (non-greedy)
+    pattern = r'(\*\*(.+?)\*\*|\*([^*]+?)\*|`([^`]+)`)'
     
     current_pos = 0
     
-    for match in re.finditer(combined_pattern, text):
+    for match in re.finditer(pattern, text):
         # Add normal text before this match
         if match.start() > current_pos:
             paragraph.add_run(text[current_pos:match.start()])
         
         full_match = match.group(0)
         
-        if full_match.startswith('**') and full_match.endswith('**'):
+        if full_match.startswith('**'):
             # Bold text
             bold_text = match.group(2)
             if bold_text:
                 run = paragraph.add_run(bold_text)
                 run.bold = True
-        elif full_match.startswith('*') and full_match.endswith('*'):
+        elif full_match.startswith('*'):
             # Italic text
             italic_text = match.group(3)
             if italic_text:
                 run = paragraph.add_run(italic_text)
                 run.italic = True
+        elif full_match.startswith('`'):
+            # Inline code text
+            code_text = match.group(4)
+            if code_text:
+                run = paragraph.add_run(code_text)
+                run.font.name = 'Courier New'
         
         current_pos = match.end()
     
@@ -395,30 +444,37 @@ def export_to_docx(
     setup_styles(doc, report_level)
     
     # Add cover page
+    import os
+    logo_path = os.path.join(os.path.dirname(__file__), "logo", "DarkLogo.png")
+    
+    if os.path.exists(logo_path):
+        try:
+            # Add logo at the top
+            doc.add_paragraph().add_run().add_break() # Top margin
+            logo_para = doc.add_paragraph()
+            logo_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = logo_para.add_run()
+            run.add_picture(logo_path, width=Inches(3.0))
+            doc.add_paragraph().add_run().add_break() # Space after logo
+        except Exception as e:
+            print(f"⚠️ Could not load logo into DOCX: {e}")
+            for _ in range(5): doc.add_paragraph()
+    else:
+        for _ in range(5): doc.add_paragraph()
+
     title_paragraph = doc.add_paragraph()
     title_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
     title_run = title_paragraph.add_run(title)
     title_run.font.size = Pt(24 if report_level == "student" else 22)
     title_run.font.bold = True
     
-    # Add level indicator
-    doc.add_paragraph()
-    level_names = {
-        "student": "Educational Guide",
-        "professor": "Teaching Resource",
-        "researcher": "Research Report"
-    }
-    subtitle = doc.add_paragraph()
-    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    subtitle_run = subtitle.add_run(level_names.get(report_level, "Report"))
-    subtitle_run.font.size = Pt(14)
-    subtitle_run.font.italic = True
+    doc.add_paragraph() # Spacer
     
     # Add date
     from datetime import datetime
     date_para = doc.add_paragraph()
     date_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    date_run = date_para.add_run(f"Generated: {datetime.now().strftime('%B %d, %Y')}")
+    date_run = date_para.add_run(datetime.now().strftime('%B %d, %Y'))
     date_run.font.size = Pt(11)
     
     # Page break after cover
@@ -427,7 +483,9 @@ def export_to_docx(
     # Add sections
     for section in sections:
         # Add section heading
-        doc.add_heading(section.heading, level=1)
+        heading = doc.add_heading(section.heading, level=1)
+        for run in heading.runs:
+            run.font.color.rgb = RGBColor(0x1E, 0x1B, 0x4B)
         
         # Process content with Markdown support
         # This supports inline images via ![caption](url) markdown syntax

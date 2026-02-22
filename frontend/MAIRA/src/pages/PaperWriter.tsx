@@ -2,7 +2,6 @@ import { useState, useCallback, useRef, useEffect } from 'react';
 import axios from 'axios';
 import { Link } from 'react-router-dom';
 import {
-  Shield,
   Plus,
   Search,
   FileText,
@@ -24,7 +23,10 @@ import {
   Copy,
   Eye,
   EyeOff,
+  Layout,
 } from 'lucide-react';
+import { useTheme } from '../context/ThemeContext';
+import { toast } from 'sonner';
 import { basicSetup } from 'codemirror';
 import { EditorView, ViewUpdate, keymap } from '@codemirror/view';
 import { EditorState } from '@codemirror/state';
@@ -34,6 +36,23 @@ import './PaperWriter.css';
 import { jsPDF } from "jspdf";
 import * as docx from "docx";
 import { saveAs } from "file-saver";
+import Lenis from 'lenis';
+import { latex } from 'codemirror-lang-latex';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import {
+  Bold,
+  Italic,
+  Underline,
+  Quote,
+  List,
+  Link as LinkIcon,
+  Image as ImageIcon,
+  Heading1,
+  Heading2,
+  Code,
+  Table,
+} from 'lucide-react';
 
 // ─── LaTeX templates ───────────────────────────────────
 const TEMPLATES: Record<string, { name: string; description: string; icon: string; content: string }> = {
@@ -485,6 +504,10 @@ export const PaperWriter = () => {
   const [showNewFileModal, setShowNewFileModal] = useState(false);
   const [newFileName, setNewFileName] = useState('');
   const [showTemplates, setShowTemplates] = useState(true);
+  const { theme } = useTheme();
+
+  // ── Navigation ──
+  // (Back button logic moved to render)
 
   // ── Sidebar state ──
   const [sidebarTab, setSidebarTab] = useState<'files' | 'chats'>('files');
@@ -537,17 +560,121 @@ export const PaperWriter = () => {
     };
   }, [resizing]);
 
+  // ── Layout state ──
+  const [showLayoutMenu, setShowLayoutMenu] = useState(false);
+
+  const applyLayout = (type: 'standard' | 'coding' | 'review') => {
+    const w = window.innerWidth;
+    if (type === 'standard') {
+      setSidebarCollapsed(false);
+      setPreviewCollapsed(false);
+      setSidebarWidth(Math.max(250, w * 0.15));
+      setPreviewWidth(w * 0.40);
+    } else if (type === 'coding') {
+      setSidebarCollapsed(true);
+      setPreviewCollapsed(false);
+      setPreviewWidth(w * 0.25);
+    } else if (type === 'review') {
+      setSidebarCollapsed(true);
+      setPreviewCollapsed(false);
+      setPreviewWidth(w * 0.70);
+    }
+    setShowLayoutMenu(false);
+  };
+
   // ── Export menu state ──
   const [showExportMenu, setShowExportMenu] = useState(false);
 
   // ── Editor refs ──
   const editorContainerRef = useRef<HTMLDivElement>(null);
   const editorViewRef = useRef<EditorView | null>(null);
+
+  const scrollToLine = useCallback((line: number) => {
+    if (!editorViewRef.current) return;
+    const view = editorViewRef.current;
+
+    // CodeMirror lines are 1-indexed
+    const docLines = view.state.doc.lines;
+    const targetLine = Math.min(Math.max(1, line), docLines);
+
+    const lineInfo = view.state.doc.line(targetLine);
+
+    view.dispatch({
+      effects: EditorView.scrollIntoView(lineInfo.from, { y: 'center' }),
+      selection: { anchor: lineInfo.from },
+    });
+    view.focus();
+  }, []);
+
+  const insertFormat = useCallback((type: string) => {
+    if (!editorViewRef.current) return;
+    const view = editorViewRef.current;
+    const { from, to } = view.state.selection.main;
+    const text = view.state.sliceDoc(from, to);
+
+    let insert = '';
+    let cursorOffset = 0;
+
+    switch (type) {
+      case 'bold': insert = `\\textbf{${text}}`; cursorOffset = 8; break;
+      case 'italic': insert = `\\textit{${text}}`; cursorOffset = 8; break;
+      case 'underline': insert = `\\underline{${text}}`; cursorOffset = 11; break;
+      case 'quote': insert = `\\begin{quote}\n${text}\n\\end{quote}`; cursorOffset = 14; break;
+      case 'list': insert = `\\begin{itemize}\n  \\item ${text}\n\\end{itemize}`; cursorOffset = 18; break;
+      case 'h1': insert = `\\section{${text}}`; cursorOffset = 9; break;
+      case 'h2': insert = `\\subsection{${text}}`; cursorOffset = 12; break;
+      case 'code': insert = `\\texttt{${text}}`; cursorOffset = 8; break;
+      case 'link': insert = `\\href{url}{${text}}`; cursorOffset = 6; break;
+      case 'image': insert = `\\includegraphics[width=0.8\\textwidth]{filename}`; cursorOffset = 28; break;
+      case 'table': insert = `\\begin{table}[ht]\n  \\centering\n  \\begin{tabular}{c c}\n    A & B \\\\\n    C & D\n  \\end{tabular}\n  \\caption{Caption}\n  \\label{tab:my_label}\n\\end{table}`; cursorOffset = 0; break;
+      default: return;
+    }
+
+    view.dispatch({
+      changes: { from, to, insert },
+      selection: { anchor: from + cursorOffset },
+    });
+    view.focus();
+  }, []);
   const compileTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const previewBodyRef = useRef<HTMLDivElement>(null);
+  const lenisInstances = useRef<any[]>([]);
 
   const activeFile = files.find((f) => f.id === activeFileId);
   const outline = activeFile ? parseOutline(activeFile.content) : [];
+
+  // ── Lenis RAF Loop ──
+  useEffect(() => {
+    let reqId: number;
+    const raf = (time: number) => {
+      lenisInstances.current.forEach((l) => l.raf(time));
+      reqId = requestAnimationFrame(raf);
+    };
+    reqId = requestAnimationFrame(raf);
+    return () => cancelAnimationFrame(reqId);
+  }, []);
+
+  // ── Lenis for Preview ──
+  useEffect(() => {
+    if (!previewBodyRef.current || previewCollapsed) return;
+
+    const lenis = new Lenis({
+      wrapper: previewBodyRef.current,
+      duration: 1.2,
+      easing: (t) => Math.min(1, 1.001 - Math.pow(2, -10 * t)),
+      orientation: 'vertical',
+      gestureOrientation: 'vertical',
+      smoothWheel: true,
+    });
+
+    lenisInstances.current.push(lenis);
+
+    return () => {
+      lenis.destroy();
+      lenisInstances.current = lenisInstances.current.filter((l) => l !== lenis);
+    };
+  }, [previewCollapsed, theme]); // Re-init on theme/collapse change if needed
 
   // ── Auto scroll chat ──
   useEffect(() => {
@@ -570,6 +697,7 @@ export const PaperWriter = () => {
         basicSetup,
         oneDark,
         keymap.of([indentWithTab]),
+        EditorView.lineWrapping,
         EditorView.updateListener.of((update: ViewUpdate) => {
           if (update.docChanged) {
             const newContent = update.state.doc.toString();
@@ -588,9 +716,13 @@ export const PaperWriter = () => {
           }
         }),
         EditorView.theme({
-          '&': { backgroundColor: 'transparent' },
+          '&': {
+            backgroundColor: 'transparent'
+          },
           '.cm-gutters': { backgroundColor: 'transparent' },
+          '.cm-activeLine': { backgroundColor: 'rgba(124, 58, 237, 0.04)' },
         }),
+        latex(),
       ],
     });
 
@@ -601,14 +733,27 @@ export const PaperWriter = () => {
 
     editorViewRef.current = view;
 
+    // Attach Lenis to Editor
+    const lenis = new Lenis({
+      wrapper: view.scrollDOM,
+      duration: 1.2,
+      easing: (t) => Math.min(1, 1.001 - Math.pow(2, -10 * t)),
+      orientation: 'vertical',
+      gestureOrientation: 'vertical',
+      smoothWheel: true,
+    });
+    lenisInstances.current.push(lenis);
+
     // Initial compile
     setPreviewHtml(renderPreview(activeFile.content));
 
     return () => {
+      lenis.destroy();
+      lenisInstances.current = lenisInstances.current.filter((l) => l !== lenis);
       view.destroy();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeFileId]);
+  }, [activeFileId, theme]);
 
   // ── Create file from template ──
   const createFromTemplate = useCallback(
@@ -733,6 +878,7 @@ export const PaperWriter = () => {
         text: "Sorry, I couldn't connect to the AI server. Please make sure the backend is running on port 8000.",
       };
       setChatMessages((prev) => [...prev, errorMsg]);
+      toast.error("Failed to connect to AI server");
     } finally {
       setAiThinking(false);
     }
@@ -774,7 +920,7 @@ export const PaperWriter = () => {
       const htmlDoc = parser.parseFromString(previewHtml, 'text/html');
       const nodes = Array.from(htmlDoc.body.children);
 
-      const docChildren: docx.Paragraph[] = [];
+      const docChildren: (docx.Paragraph | docx.Table)[] = [];
 
       // Helper to process inline text with formatting
       const retrieveTextRuns = (el: Element): docx.TextRun[] => {
@@ -805,12 +951,12 @@ export const PaperWriter = () => {
       };
 
       // Recursive function to process blocks
-      const processNode = (node: Node): docx.Paragraph[] => {
+      const processNode = (node: Node): (docx.Paragraph | docx.Table)[] => {
         if (node.nodeType !== Node.ELEMENT_NODE) return [];
         const el = node as HTMLElement;
         const tag = el.tagName;
 
-        const paragraphs: docx.Paragraph[] = [];
+        const paragraphs: (docx.Paragraph | docx.Table)[] = [];
 
         if (['H1', 'H2', 'H3', 'H4', 'H5', 'H6'].includes(tag)) {
           const levels: Record<string, any> = {
@@ -853,9 +999,44 @@ export const PaperWriter = () => {
               children: retrieveTextRuns(el)
             }));
           }
-        } else if (tag === 'TABLE') {
-          paragraphs.push(new docx.Paragraph({
-            children: [new docx.TextRun({ text: "[Table content not fully supported in export]", italics: true })]
+          const rows: docx.TableRow[] = [];
+          const trs = Array.from(el.querySelectorAll('tr'));
+
+          trs.forEach(tr => {
+            const cells: docx.TableCell[] = [];
+            const tds = Array.from(tr.querySelectorAll('th, td'));
+
+            tds.forEach(td => {
+              cells.push(new docx.TableCell({
+                children: [new docx.Paragraph({
+                  children: retrieveTextRuns(td as HTMLElement)
+                })],
+                borders: {
+                  top: { style: docx.BorderStyle.SINGLE, size: 1, color: "888888" },
+                  bottom: { style: docx.BorderStyle.SINGLE, size: 1, color: "888888" },
+                  left: { style: docx.BorderStyle.SINGLE, size: 1, color: "888888" },
+                  right: { style: docx.BorderStyle.SINGLE, size: 1, color: "888888" },
+                },
+                margins: {
+                  top: 100,
+                  bottom: 100,
+                  left: 100,
+                  right: 100,
+                }
+              }));
+            });
+
+            rows.push(new docx.TableRow({
+              children: cells
+            }));
+          });
+
+          paragraphs.push(new docx.Table({
+            rows: rows,
+            width: {
+              size: 100,
+              type: docx.WidthType.PERCENTAGE,
+            },
           }));
         }
 
@@ -877,7 +1058,7 @@ export const PaperWriter = () => {
 
     } catch (error) {
       console.error("Export failed:", error);
-      alert("Failed to export DOCX. See console for details.");
+      toast.error("Failed to export DOCX");
     }
   }, [previewHtml, activeFile]);
 
@@ -914,16 +1095,16 @@ export const PaperWriter = () => {
   }, [activeFile]);
 
   // ── Render: Template selection screen ──
-  if (showTemplates && files.length === 0) {
+  if (showTemplates) {
     return (
       <div className="pw-root">
         {/* Top bar */}
         <div className="pw-topbar">
           <div className="pw-topbar-left">
             <Link to="/" className="pw-topbar-logo">
-              <Shield size={16} color="#fff" />
+              <img src="/DarkLogo.png" alt="MAIRA" className="h-20 w-auto object-contain block dark:hidden" />
+              <img src="/Logo.png" alt="MAIRA" className="h-20 w-auto object-contain hidden dark:block" />
             </Link>
-            <span className="pw-topbar-title">MAIRA Paper Writer</span>
           </div>
           <div className="pw-topbar-right">
             <Link to="/" className="pw-topbar-btn">
@@ -1001,14 +1182,24 @@ export const PaperWriter = () => {
 
   // ── Render: Main editor workspace ──
   return (
-    <div className="pw-root">
+    <div className="pw-root bg-black min-h-screen text-white">
       {/* ── Top Bar ── */}
       <div className="pw-topbar">
         <div className="pw-topbar-left">
+          <button
+            onClick={() => {
+              setActiveFileId(null);
+              setShowTemplates(true);
+            }}
+            style={{ marginRight: 12, display: 'flex', alignItems: 'center', backgroundColor: 'transparent', border: 'none', cursor: 'pointer', color: '#888', transition: 'color 0.2s' }}
+            title="Back"
+          >
+            <ArrowLeft size={18} />
+          </button>
           <Link to="/" className="pw-topbar-logo">
-            <Shield size={16} color="#fff" />
+            <img src="/DarkLogo.png" alt="MAIRA" className="h-20 w-auto object-contain block dark:hidden" />
+            <img src="/Logo.png" alt="MAIRA" className="h-20 w-auto object-contain hidden dark:block" />
           </Link>
-          <span className="pw-topbar-title">MAIRA Paper Writer</span>
           {!sidebarCollapsed ? (
             <button
               className="pw-sidebar-icon-btn"
@@ -1029,6 +1220,53 @@ export const PaperWriter = () => {
         </div>
 
         <div className="pw-topbar-right">
+          {/* Layout menu */}
+          <div style={{ position: 'relative' }}>
+            <button
+              className="pw-topbar-btn"
+              onClick={() => setShowLayoutMenu(!showLayoutMenu)}
+              title="Change layout"
+            >
+              <Layout size={14} />
+              Layout
+              <ChevronDown size={12} />
+            </button>
+            {showLayoutMenu && (
+              <div className="pw-export-menu" style={{ minWidth: 200 }}>
+                <div style={{ padding: '8px 12px', fontSize: 11, fontWeight: 600, color: '#666', textTransform: 'uppercase' }}>
+                  Workspace Layouts
+                </div>
+                <button
+                  onClick={() => applyLayout('standard')}
+                  style={{ height: 'auto', padding: '8px 12px', alignItems: 'flex-start', justifyContent: 'flex-start' }}
+                >
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 2, alignItems: 'flex-start' }}>
+                    <span style={{ fontWeight: 500 }}>Standard (60:40)</span>
+                    <span style={{ fontSize: 11, color: '#999', fontWeight: 400 }}>Balanced drafting</span>
+                  </div>
+                </button>
+                <button
+                  onClick={() => applyLayout('coding')}
+                  style={{ height: 'auto', padding: '8px 12px', alignItems: 'flex-start', justifyContent: 'flex-start' }}
+                >
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 2, alignItems: 'flex-start' }}>
+                    <span style={{ fontWeight: 500 }}>Deep Coding (75:25)</span>
+                    <span style={{ fontSize: 11, color: '#999', fontWeight: 400 }}>Max editor space</span>
+                  </div>
+                </button>
+                <button
+                  onClick={() => applyLayout('review')}
+                  style={{ height: 'auto', padding: '8px 12px', alignItems: 'flex-start', justifyContent: 'flex-start' }}
+                >
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 2, alignItems: 'flex-start' }}>
+                    <span style={{ fontWeight: 500 }}>Proofread (30:70)</span>
+                    <span style={{ fontSize: 11, color: '#999', fontWeight: 400 }}>Preview focused</span>
+                  </div>
+                </button>
+              </div>
+            )}
+          </div>
+
           <button
             className="pw-topbar-btn"
             onClick={() => setPreviewCollapsed(!previewCollapsed)}
@@ -1167,7 +1405,8 @@ export const PaperWriter = () => {
                     <div
                       key={idx}
                       className="pw-outline-item"
-                      style={{ paddingLeft: 8 + item.level * 14 }}
+                      style={{ paddingLeft: 8 + item.level * 14, cursor: 'pointer' }}
+                      onClick={() => scrollToLine(item.line)}
                     >
                       {item.label}
                     </div>
@@ -1192,12 +1431,11 @@ export const PaperWriter = () => {
                 ) : (
                   chatMessages.map((msg) => (
                     <div key={msg.id} className={`pw-chat-msg ${msg.role}`}>
-                      <div className="pw-chat-msg-text" dangerouslySetInnerHTML={{
-                        __html: msg.text
-                          .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-                          .replace(/\n/g, '<br>')
-                          .replace(/• /g, '&bull; ')
-                      }} />
+                      <div className="pw-chat-msg-text prose prose-invert prose-sm max-w-none">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {msg.text}
+                        </ReactMarkdown>
+                      </div>
                       {msg.role === 'ai' && msg.applied && msg.updatedLatex && (
                         <div className="pw-chat-msg-applied">
                           <Check size={12} />
@@ -1266,6 +1504,48 @@ export const PaperWriter = () => {
             </button>
           </div>
 
+          {/* ── Formatting Toolbar ── */}
+          {activeFile && (
+            <div className="pw-toolbar">
+              <button onClick={() => insertFormat('bold')} title="Bold">
+                <Bold size={14} />
+              </button>
+              <button onClick={() => insertFormat('italic')} title="Italic">
+                <Italic size={14} />
+              </button>
+              <button onClick={() => insertFormat('underline')} title="Underline">
+                <Underline size={14} />
+              </button>
+              <div className="pw-toolbar-sep" />
+              <button onClick={() => insertFormat('h1')} title="Section">
+                <Heading1 size={14} />
+              </button>
+              <button onClick={() => insertFormat('h2')} title="Subsection">
+                <Heading2 size={14} />
+              </button>
+              <div className="pw-toolbar-sep" />
+              <button onClick={() => insertFormat('list')} title="List">
+                <List size={14} />
+              </button>
+              <button onClick={() => insertFormat('quote')} title="Quote">
+                <Quote size={14} />
+              </button>
+              <button onClick={() => insertFormat('code')} title="Code">
+                <Code size={14} />
+              </button>
+              <div className="pw-toolbar-sep" />
+              <button onClick={() => insertFormat('link')} title="Link">
+                <LinkIcon size={14} />
+              </button>
+              <button onClick={() => insertFormat('image')} title="Image">
+                <ImageIcon size={14} />
+              </button>
+              <button onClick={() => insertFormat('table')} title="Table">
+                <Table size={14} />
+              </button>
+            </div>
+          )}
+
           {/* Editor Body */}
           {activeFile ? (
             <div className="pw-editor-body" ref={editorContainerRef} />
@@ -1321,23 +1601,17 @@ export const PaperWriter = () => {
                   <span className="pw-preview-page-info">Preview</span>
                 </div>
                 <div className="pw-preview-header-right">
-                  <select className="pw-preview-zoom-select">
-                    <option>Zoom to fit</option>
-                    <option>50%</option>
-                    <option>75%</option>
-                    <option>100%</option>
-                    <option>125%</option>
-                    <option>150%</option>
-                  </select>
+                  {/* Zoom toggle removed - Default is Zoom to fit */}
                 </div>
               </div>
 
               {/* Preview body - SCROLLABLE */}
-              <div className="pw-preview-body">
+              <div className="pw-preview-body" ref={previewBodyRef}>
                 {activeFile ? (
                   <div
                     className="pw-preview-page"
                     dangerouslySetInnerHTML={{ __html: previewHtml }}
+                    style={{ width: '100%', maxWidth: 'none' }}
                   />
                 ) : (
                   <div
@@ -1422,12 +1696,12 @@ export const PaperWriter = () => {
         )
       }
 
-      {/* Close export menu on outside click */}
+      {/* Close menus on outside click */}
       {
-        showExportMenu && (
+        (showExportMenu || showLayoutMenu) && (
           <div
             style={{ position: 'fixed', inset: 0, zIndex: 29 }}
-            onClick={() => setShowExportMenu(false)}
+            onClick={() => { setShowExportMenu(false); setShowLayoutMenu(false); }}
           />
         )
       }

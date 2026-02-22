@@ -47,6 +47,8 @@ export interface Message {
     thought?: string;
     reasoning?: string;  // For reasoning/thinking blocks
     status?: string;
+    statusDetail?: string;  // Additional detail from backend status event
+    statusIcon?: string;    // Icon emoji from backend status event
     progress?: number;
     type?: 'streaming' | 'final';
     message_id?: string;  // For editing messages
@@ -64,12 +66,26 @@ export interface Message {
     editGroupId?: string;  // Links user message to its agent response
     isEdit?: boolean;  // True if this message is an edit of a previous message
     originalMessageIndex?: number;  // Original position in conversation before editing
+    // Deep research phase tracking (from backend phase events)
+    currentPhase?: string;       // Phase key: 'planning' | 'searching' | 'analyzing' | 'drafting' | 'finalizing'
+    phaseName?: string;          // Display name of current phase
+    phaseIcon?: string;          // Icon emoji for the phase
+    phaseDescription?: string;   // Description of what the phase does
+    // Research mode info (from backend init event)
+    mode?: string;               // Research mode: 'chat' | 'deep_research' | 'literature_survey'
+    modeDisplay?: string;        // Display name for mode
+    // Progress hold for phase boundaries
+    holdPhase?: boolean;
+    holdValue?: number;
 }
 
 export interface ActiveStep {
-    tool: string;
-    message: string;
-    status: 'loading' | 'done';
+    id: string;
+    action: string;
+    status: string;
+    detail?: string;
+    phase?: string;
+    progress?: number;
     timestamp: number;
 }
 
@@ -90,6 +106,7 @@ export interface ThreadContextType {
     checkpoints: CheckpointInfo[];
     isLoading: boolean;
     isLoadingThreads: boolean;
+    isLoadingMessages: boolean;
     isReconnecting: boolean;  // Whether currently reconnecting to a stream
     deepResearch: boolean;
     literatureSurvey: boolean;
@@ -105,7 +122,7 @@ export interface ThreadContextType {
     selectThread: (threadId: string) => Promise<void>;
     deleteThread: (threadId: string) => Promise<void>;
     refreshThreads: () => Promise<void>;
-    sendMessage: (prompt: string, parentCheckpointId?: string, attachments?: { name: string; type: 'file' | 'image' }[]) => Promise<void>;
+    sendMessage: (prompt: string, parentCheckpointId?: string, attachments?: { name: string; type: 'file' | 'image' }[], skipMessageAdd?: boolean) => Promise<void>;
     editMessage: (messageIndex: number, newContent: string, parentCheckpointId?: string) => Promise<void>;  // Enhanced with parentCheckpointId
     setMessageVersion: (messageIndex: number, versionIndex: number) => void;  // Navigate between versions
     getMessageMetadata: (message: Message, messageIndex: number) => MessageMetadata;  // Get metadata for branching
@@ -118,6 +135,7 @@ export interface ThreadContextType {
     // Custom personas
     customPersonas: CustomPersona[];
     addCustomPersona: (name: string, instructions: string) => Promise<void>;
+    updateCustomPersona: (personaId: string, name: string, instructions: string) => Promise<void>;
     deleteCustomPersona: (personaId: string) => Promise<void>;
     getCustomPersonaInstructions: (personaId: string) => string | null;
     // Persisted sites
@@ -128,9 +146,13 @@ export interface ThreadContextType {
     fetchStateHistory: (threadId: string) => Promise<CheckpointInfo[]>;
     branchFromCheckpoint: (checkpointId: string) => Promise<Thread | null>;
     stopStream: () => void;
+    retryMessage: (messageIndex: number) => Promise<void>;
     // Uploads
     uploadFile: (file: File) => Promise<void>;
     uploadImage: (file: File, description?: string) => Promise<void>;
+    isTimelineOpen: boolean;
+    setIsTimelineOpen: (isOpen: boolean) => void;
+    isBackendReady: boolean;
 }
 
 export const ThreadContext = createContext<ThreadContextType | null>(null);

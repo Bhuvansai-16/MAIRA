@@ -25,6 +25,10 @@ const BUILT_IN_PERSONAS = [
     { id: "researcher", label: "Researcher", icon: Microscope, description: "Technical & data-driven" },
 ] as const;
 
+const countWords = (str: string) => {
+    return str.trim().split(/\s+/).filter(Boolean).length;
+};
+
 export const PersonaDropdown = ({ persona, setPersona, customPersonas, onAddPersona, onDeletePersona }: PersonaDropdownProps) => {
     const [isOpen, setIsOpen] = useState(false);
     const [isModalOpen, setIsModalOpen] = useState(false);
@@ -86,6 +90,8 @@ export const PersonaDropdown = ({ persona, setPersona, customPersonas, onAddPers
 
     const handleSavePersona = async () => {
         if (!personaName.trim() || !personaInstructions.trim()) return;
+        if (countWords(personaInstructions) > 250) return;
+
         setIsSaving(true);
         try {
             await onAddPersona(personaName.trim(), personaInstructions.trim());
@@ -260,8 +266,19 @@ export const PersonaDropdown = ({ persona, setPersona, customPersonas, onAddPers
                             onChange={(e) => setPersonaInstructions(e.target.value)}
                             placeholder="Describe how this persona should behave, write, and approach research..."
                             rows={4}
-                            className="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-white/10 text-sm text-white placeholder-neutral-500 focus:outline-none focus:border-violet-500/40 transition-all resize-none"
+                            className={cn(
+                                "w-full px-4 py-2.5 rounded-xl bg-white/5 border text-sm text-white placeholder-neutral-500 focus:outline-none transition-all resize-none",
+                                countWords(personaInstructions) > 250 ? "border-red-500/50 focus:border-red-500" : "border-white/10 focus:border-violet-500/40"
+                            )}
                         />
+                        <div className="flex justify-between mt-2">
+                            <span className={cn(
+                                "text-[10px] font-medium",
+                                countWords(personaInstructions) > 250 ? "text-red-400" : "text-neutral-500"
+                            )}>
+                                {countWords(personaInstructions)} / 250 words
+                            </span>
+                        </div>
                     </div>
                 </div>
 
@@ -275,10 +292,10 @@ export const PersonaDropdown = ({ persona, setPersona, customPersonas, onAddPers
                     </button>
                     <button
                         onClick={handleSavePersona}
-                        disabled={!personaName.trim() || !personaInstructions.trim() || isSaving}
+                        disabled={!personaName.trim() || !personaInstructions.trim() || isSaving || countWords(personaInstructions) > 250}
                         className={cn(
                             "px-5 py-2 rounded-xl text-sm font-semibold transition-all",
-                            personaName.trim() && personaInstructions.trim() && !isSaving
+                            personaName.trim() && personaInstructions.trim() && !isSaving && countWords(personaInstructions) <= 250
                                 ? "bg-violet-500/20 border border-violet-500/30 text-violet-300 hover:bg-violet-500/30 active:scale-95"
                                 : "bg-white/5 text-neutral-600 cursor-not-allowed"
                         )}

@@ -1,270 +1,257 @@
-import { useState, useEffect, useRef } from 'react';
-import { Sparkles, Search, BookOpen, FileText, CheckCircle2, Brain } from 'lucide-react';
+import { useState, useEffect } from 'react';
+import { Sparkles, Search, FileText, CheckCircle2, Brain, ClipboardList } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { motion, AnimatePresence } from 'framer-motion';
+import type { ResearchPhase } from '../types/agent';
 
 interface DeepResearchProgressProps {
     status?: string;
+    statusDetail?: string;  // Additional detail from backend
+    statusIcon?: string;    // Icon from backend
     isActive: boolean;
     progress?: number;
+    currentPhase?: ResearchPhase;  // Phase directly from backend
+    phaseName?: string;     // Phase display name from backend
+    phaseDescription?: string;  // Phase description from backend
 }
 
-// Reordered to match backend flow: Search -> Analyze -> Draft -> Reason/Verify -> Finalize
+// Research phases aligned with backend RESEARCH_PHASES
+// We use these as the "High Level Plan" for now since we don't receive a dynamic plan from the backend yet.
 const RESEARCH_PHASES = [
-    { label: 'Starting research', icon: Sparkles, color: 'from-amber-400 to-orange-500', duration: 8 },
-    { label: 'Searching sources', icon: Search, color: 'from-blue-400 to-cyan-500', duration: 15 },
-    { label: 'Analyzing papers', icon: BookOpen, color: 'from-purple-400 to-violet-500', duration: 20 },
-    { label: 'Drafting report', icon: FileText, color: 'from-pink-400 to-rose-500', duration: 20 },
-    { label: 'Deep verification', icon: Brain, color: 'from-emerald-400 to-green-500', duration: 25 },
-    { label: 'Finalizing', icon: CheckCircle2, color: 'from-teal-400 to-cyan-500', duration: 12 },
+    { key: 'planning', label: 'Planning Strategy', icon: ClipboardList },
+    { key: 'searching', label: 'Gathering Information', icon: Search },
+    { key: 'drafting', label: 'Drafting Content', icon: FileText },
+    { key: 'reasoning', label: 'Deep Reasoning', icon: Brain },
+    { key: 'finalizing', label: 'Finalizing Report', icon: CheckCircle2 },
 ];
 
-export const DeepResearchProgress = ({ status, isActive, progress: explicitProgress }: DeepResearchProgressProps) => {
+// Map phase key to index
+const PHASE_INDEX_MAP: Record<string, number> = {
+    reasoning: 3,
+    finalizing: 4,
+    completed: 5,
+    // Aliases
+    plan: 0,
+    search: 1,
+    draft: 2,
+    reason: 3,
+    finalize: 4,
+    done: 5
+};
+
+export const DeepResearchProgress = ({
+    status,
+    statusDetail,
+    isActive,
+    progress: explicitProgress,
+    currentPhase,
+    phaseDescription
+}: DeepResearchProgressProps) => {
     const [progress, setProgress] = useState(0);
     const [currentPhaseIndex, setCurrentPhaseIndex] = useState(0);
-    const [elapsed, setElapsed] = useState(0);
-    const startTimeRef = useRef(Date.now());
-    const animFrameRef = useRef<number>(0);
+    const [displayStatus, setDisplayStatus] = useState<string>('');
+    const [expanded, setExpanded] = useState(true);
 
-    // Determine phase from status text or auto-advance
+    // Determine phase from backend phase event (preferred) or fallback to status text
     useEffect(() => {
-        if (!isActive) return;
+        if (!isActive) {
+            setCurrentPhaseIndex(0);
+            return;
+        }
 
-        if (status) {
-            const lower = status.toLowerCase();
-            // Phase 1: Search
-            if (lower.includes('searching') || lower.includes('search') || lower.includes('web_search') || lower.includes('arxiv')) {
-                setCurrentPhaseIndex(1);
+        let newIndex: number | undefined;
+
+        // PRIMARY: Use phase directly from backend if available
+        if (currentPhase) {
+            const normalizedPhase = currentPhase.toLowerCase();
+            let foundIndex = PHASE_INDEX_MAP[normalizedPhase];
+
+            if (foundIndex === undefined) {
+                const key = Object.keys(PHASE_INDEX_MAP).find(k => normalizedPhase.includes(k));
+                if (key) foundIndex = PHASE_INDEX_MAP[key];
             }
-            // Phase 2: Analyze
-            else if (lower.includes('analyz') || lower.includes('reading') || lower.includes('paper') || lower.includes('literature')) {
-                setCurrentPhaseIndex(2);
-            }
-            // Phase 3: Drafting (Was 4)
-            else if (lower.includes('draft') || lower.includes('writing') || lower.includes('generat')) {
-                setCurrentPhaseIndex(3);
-            }
-            // Phase 4: Verification / Deep Reasoning (Was 3)
-            // Includes typical verification tool keywords
-            else if (
-                lower.includes('reason') ||
-                lower.includes('thinking') ||
-                lower.includes('deep') ||
-                lower.includes('validat') ||
-                lower.includes('check') ||
-                lower.includes('assess') ||
-                lower.includes('refin')
-            ) {
-                setCurrentPhaseIndex(4);
-            }
-            // Phase 5: Finalizing (Report generation and final checks)
-            // Includes "report" as that usually means report-subagent
-            else if (lower.includes('final') || lower.includes('complet') || lower.includes('report') || lower.includes('done')) {
-                setCurrentPhaseIndex(5);
+
+            if (foundIndex !== undefined) {
+                newIndex = foundIndex;
             }
         }
 
-        // Also update phase based on progress if status didn't catch it
-        if (typeof explicitProgress === 'number' && explicitProgress > 0) {
-            if (explicitProgress >= 90) setCurrentPhaseIndex(5); // Finalizing
-            else if (explicitProgress >= 75) setCurrentPhaseIndex(4); // Verification
-            else if (explicitProgress >= 60) setCurrentPhaseIndex(3); // Drafting
-            else if (explicitProgress >= 40) setCurrentPhaseIndex(2); // Analysis (Papers)
-            else if (explicitProgress >= 15) setCurrentPhaseIndex(1); // Searching
-            else setCurrentPhaseIndex(0); // Starting
-        }
-    }, [status, isActive, explicitProgress]);
+        // FALLBACK: Aggressively parse ALL text (status + details) for keywords
+        if (newIndex === undefined) {
+            const combinedText = `${status || ''} ${statusDetail || ''} ${currentPhase || ''}`.toLowerCase();
 
-    // Handle progress updates (either explicit or simulated)
+            if (combinedText.includes('plan') || combinedText.includes('todo')) {
+                newIndex = 0;
+            } else if (combinedText.includes('search') || combinedText.includes('web') || combinedText.includes('arxiv') || combinedText.includes('paper') || combinedText.includes('github') || combinedText.includes('gather')) {
+                newIndex = 1;
+            } else if (combinedText.includes('draft') || combinedText.includes('writ') || combinedText.includes('generat') || combinedText.includes('analyz') || combinedText.includes('extract') || combinedText.includes('read')) {
+                // We map 'analyzing' and 'extracting' keywords to Drafting phase now that Analyzing is removed
+                newIndex = 2;
+            } else if (combinedText.includes('reason') || combinedText.includes('verify') || combinedText.includes('think') || combinedText.includes('check')) {
+                newIndex = 3;
+            } else if (combinedText.includes('final') || combinedText.includes('complet') || combinedText.includes('report') || combinedText.includes('summar') || combinedText.includes('export') || combinedText.includes('pdf')) {
+                newIndex = 4;
+            }
+        }
+
+        // TERTIARY: Update phase based on explicit progress percentage
+        if (newIndex === undefined && typeof explicitProgress === 'number') {
+            if (explicitProgress >= 90) newIndex = 4;
+            else if (explicitProgress >= 70) newIndex = 3;
+            else if (explicitProgress >= 40) newIndex = 2;
+            else if (explicitProgress >= 15) newIndex = 1;
+            else newIndex = 0;
+        }
+
+        // LATCH: Only allow phase to move FORWARD, never backwards
+        if (newIndex !== undefined) {
+            setCurrentPhaseIndex(prev => Math.max(prev, newIndex!));
+        }
+    }, [status, statusDetail, isActive, explicitProgress, currentPhase]);
+
+    useEffect(() => {
+        if (status) setDisplayStatus(status);
+    }, [status, statusDetail]);
+
+    // Handle progress updates with anti-regression latch
     useEffect(() => {
         if (!isActive) {
             setProgress(0);
-            setElapsed(0);
-            startTimeRef.current = Date.now();
             return;
         }
 
-        // If backend provides explicit progress, use it directly (no simulation)
-        if (typeof explicitProgress === 'number' && explicitProgress > 0) {
-            setProgress(explicitProgress);
-            return;
+        if (typeof explicitProgress === 'number') {
+            // LATCH: Only move forward
+            setProgress(prev => Math.max(prev, explicitProgress));
         }
-
-        // Fallback: Simulated progress for smooth UX when no explicit updates
-        const totalEstimated = RESEARCH_PHASES.reduce((sum, p) => sum + p.duration, 0); // ~100s total
-
-        const tick = () => {
-            const now = Date.now();
-            const elapsedSec = (now - startTimeRef.current) / 1000;
-            setElapsed(elapsedSec);
-
-            // Asymptotic progress: fast at first, slows down near 95%
-            // Never reaches 100% until actually done
-            const rawProgress = 1 - Math.exp(-elapsedSec / (totalEstimated * 0.6));
-            const cappedProgress = Math.min(rawProgress * 95, 95); // Cap at 95%
-
-            setProgress(cappedProgress);
-            animFrameRef.current = requestAnimationFrame(tick);
-        };
-
-        animFrameRef.current = requestAnimationFrame(tick);
-        return () => {
-            if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
-        };
     }, [isActive, explicitProgress]);
 
     if (!isActive) return null;
 
-    const currentPhase = RESEARCH_PHASES[currentPhaseIndex];
-    const PhaseIcon = currentPhase.icon;
-
-    const formatTime = (seconds: number) => {
-        const mins = Math.floor(seconds / 60);
-        const secs = Math.floor(seconds % 60);
-        return mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-    };
-
-    // Estimate remaining (rough)
-    const totalEstimated = RESEARCH_PHASES.reduce((sum, p) => sum + p.duration, 0);
-    const estimatedRemaining = Math.max(0, totalEstimated - elapsed);
-
     return (
         <AnimatePresence>
             <motion.div
-                initial={{ opacity: 0, y: 20, scale: 0.95 }}
+                initial={{ opacity: 0, y: 10, scale: 0.98 }}
                 animate={{ opacity: 1, y: 0, scale: 1 }}
-                exit={{ opacity: 0, y: -10, scale: 0.95 }}
-                transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
-                className="w-full max-w-[85%]"
+                exit={{ opacity: 0, scale: 0.95 }}
+                className="w-full max-w-md font-sans"
             >
-                <div className="relative rounded-2xl border border-white/10 bg-[#121212] overflow-hidden shadow-2xl shadow-black/50">
-                    {/* Glowing top border */}
-                    <div className={cn(
-                        "absolute top-0 left-0 right-0 h-[2px] bg-gradient-to-r",
-                        currentPhase.color
-                    )} />
+                <div className="bg-[#121212] border border-white/10 rounded-xl overflow-hidden shadow-2xl animate-in fade-in zoom-in duration-300">
 
-                    <div className="p-5 space-y-4">
-                        {/* Phase Header */}
-                        <div className="flex items-center justify-between">
-                            <div className="flex items-center gap-3">
-                                <div className={cn(
-                                    "flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br shadow-lg",
-                                    currentPhase.color
-                                )}>
-                                    <PhaseIcon size={18} className="text-white" />
-                                </div>
-                                <div>
-                                    <motion.h3
-                                        key={currentPhase.label}
-                                        initial={{ opacity: 0, x: -10 }}
-                                        animate={{ opacity: 1, x: 0 }}
-                                        className="text-sm font-bold text-white tracking-tight"
-                                    >
-                                        {currentPhase.label}
-                                    </motion.h3>
-                                    <p className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">
-                                        Deep Research Mode
-                                    </p>
-                                </div>
+                    {/* Header */}
+                    <div className="flex items-center justify-between px-4 py-3 border-b border-white/5 bg-white/[0.02]">
+                        <div className="flex items-center gap-2">
+                            <div className="p-1.5 rounded-lg bg-blue-500/10 text-blue-400">
+                                <Sparkles size={14} />
                             </div>
-                            <div className="text-right">
-                                <span className="text-xs font-mono font-bold text-neutral-400">
-                                    {Math.round(progress)}%
-                                </span>
-                                <p className="text-[10px] text-neutral-600 font-medium">
-                                    {typeof explicitProgress === 'number' ? '' : `~${formatTime(estimatedRemaining)} remaining`}
-                                </p>
-                            </div>
+                            <h3 className="text-sm font-semibold text-neutral-200">
+                                {phaseDescription || 'Deep Research'}
+                            </h3>
                         </div>
+                        <button
+                            onClick={() => setExpanded(!expanded)}
+                            className="text-neutral-500 hover:text-white transition-colors"
+                        >
+                            {/* Simple toggle if needed, or just status badge */}
+                            <span className="text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded-full bg-white/5 border border-white/5">
+                                {expanded ? 'Hide' : 'Show'}
+                            </span>
+                        </button>
+                    </div>
 
-                        {/* Progress Bar */}
-                        <div className="relative">
-                            <div className="h-2 rounded-full bg-white/5 overflow-hidden">
-                                {/* Animated background shimmer */}
-                                <div className="absolute inset-0 rounded-full overflow-hidden">
-                                    <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/5 to-transparent animate-shimmer" />
-                                </div>
-
-                                {/* Progress fill */}
-                                <motion.div
-                                    className={cn(
-                                        "h-full rounded-full bg-gradient-to-r relative",
-                                        currentPhase.color
-                                    )}
-                                    initial={{ width: '0%' }}
-                                    animate={{ width: `${progress}%` }}
-                                    transition={{ duration: 0.5, ease: 'easeOut' }}
-                                >
-                                    {/* Glow on progress head */}
-                                    <div className="absolute right-0 top-1/2 -translate-y-1/2 w-4 h-4 rounded-full bg-white/30 blur-sm" />
-                                    {/* Pulse dot at the end */}
-                                    <div className="absolute right-0 top-1/2 -translate-y-1/2 translate-x-1/2">
-                                        <span className="relative flex h-3 w-3">
-                                            <span className={cn(
-                                                "animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 bg-gradient-to-r",
-                                                currentPhase.color
-                                            )} />
-                                            <span className="relative inline-flex rounded-full h-3 w-3 bg-white shadow-lg" />
-                                        </span>
-                                    </div>
-                                </motion.div>
-                            </div>
-                        </div>
-
-                        {/* Phase Dots */}
-                        <div className="flex items-center justify-between px-1">
-                            {RESEARCH_PHASES.map((phase, idx) => {
-                                const Icon = phase.icon;
-                                const isCompleted = idx < currentPhaseIndex;
-                                const isCurrent = idx === currentPhaseIndex;
-                                return (
-                                    <div
-                                        key={idx}
-                                        className="flex flex-col items-center gap-1"
-                                        title={phase.label}
-                                    >
-                                        <div className={cn(
-                                            "flex h-6 w-6 items-center justify-center rounded-full transition-all duration-500",
-                                            isCompleted && "bg-green-500/20 text-green-400",
-                                            isCurrent && "bg-white/10 text-white ring-2 ring-white/20",
-                                            !isCompleted && !isCurrent && "bg-white/5 text-neutral-600"
-                                        )}>
-                                            {isCompleted ? (
-                                                <CheckCircle2 size={12} />
-                                            ) : (
-                                                <Icon size={12} className={isCurrent ? "animate-pulse" : ""} />
-                                            )}
-                                        </div>
-                                        <span className={cn(
-                                            "text-[8px] font-bold uppercase tracking-wider max-w-[60px] text-center leading-tight hidden sm:block",
-                                            isCurrent ? "text-neutral-300" : "text-neutral-600"
-                                        )}>
-                                            {phase.label.split(' ').slice(0, 2).join(' ')}
-                                        </span>
-                                    </div>
-                                );
-                            })}
-                        </div>
-
-                        {/* Current Status from backend */}
-                        {status && status !== 'Thinking...' && (
+                    {/* Content */}
+                    <AnimatePresence initial={false}>
+                        {expanded && (
                             <motion.div
-                                key={status}
-                                initial={{ opacity: 0 }}
-                                animate={{ opacity: 1 }}
-                                className="flex items-center gap-2 pt-1 border-t border-white/5"
+                                initial={{ height: 0, opacity: 0 }}
+                                animate={{ height: 'auto', opacity: 1 }}
+                                exit={{ height: 0, opacity: 0 }}
+                                transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+                                className="border-b border-white/5"
                             >
-                                <div className="flex gap-1">
-                                    <div className="h-1 w-1 rounded-full bg-blue-500 animate-bounce [animation-delay:-0.3s]" />
-                                    <div className="h-1 w-1 rounded-full bg-blue-500 animate-bounce [animation-delay:-0.15s]" />
-                                    <div className="h-1 w-1 rounded-full bg-blue-500 animate-bounce" />
+                                <div className="p-4 space-y-3">
+                                    {RESEARCH_PHASES.map((phase, idx) => {
+                                        const isCompleted = idx < currentPhaseIndex;
+                                        const isCurrent = idx === currentPhaseIndex;
+
+                                        return (
+                                            <div key={phase.key} className="flex items-start gap-3">
+                                                <div className="relative flex items-center justify-center pt-0.5">
+                                                    {isCompleted ? (
+                                                        <div className="h-4 w-4 rounded-full bg-neutral-800 border border-neutral-700 flex items-center justify-center text-neutral-400">
+                                                            <CheckCircle2 size={10} />
+                                                        </div>
+                                                    ) : isCurrent ? (
+                                                        <div className="relative h-4 w-4">
+                                                            <div className="absolute inset-0 rounded-full border-2 border-white/20" />
+                                                            <div className="absolute inset-0 rounded-full border-2 border-t-blue-500 animate-spin" />
+                                                        </div>
+                                                    ) : (
+                                                        <div className="h-4 w-4 rounded-full border border-dashed border-neutral-700 bg-transparent" />
+                                                    )}
+
+                                                    {/* Connector Line */}
+                                                    {idx !== RESEARCH_PHASES.length - 1 && (
+                                                        <div className={cn(
+                                                            "absolute top-5 left-1/2 -translate-x-1/2 w-[1px] h-3 bg-neutral-800",
+                                                            (isCompleted) && "bg-neutral-700"
+                                                        )} />
+                                                    )}
+                                                </div>
+
+                                                <span className={cn(
+                                                    "text-sm font-medium transition-colors duration-300",
+                                                    isCurrent ? "text-blue-100" : isCompleted ? "text-neutral-300" : "text-neutral-500"
+                                                )}>
+                                                    {phase.label}
+
+                                                    {/* NEW: Show the actual subagent name next to the active phase */}
+                                                    {isCurrent && status && (
+                                                        <span className="ml-2 text-[10px] text-blue-300/80 font-mono tracking-wider animate-pulse">
+                                                            [{status}]
+                                                        </span>
+                                                    )}
+                                                </span>
+                                            </div>
+                                        );
+                                    })}
                                 </div>
-                                <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-wider truncate">
-                                    {status}
-                                </span>
                             </motion.div>
                         )}
+                    </AnimatePresence>
+
+                    {/* Footer / Current Action Log */}
+                    <div className="p-3 bg-black/20 flex flex-col gap-2">
+                        <div className="flex items-center gap-2.5">
+                            {/* Spinner for active state */}
+                            <div className="relative flex h-3 w-3">
+                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-500 opacity-75"></span>
+                                <span className="relative inline-flex rounded-full h-3 w-3 bg-blue-500"></span>
+                            </div>
+
+                            <span className="text-xs font-medium text-blue-400/90 tracking-wide">
+                                Researching...
+                            </span>
+                        </div>
+
+                        {/* Actual log message from backend (statusDetail) */}
+                        {(statusDetail || displayStatus) && (
+                            <div className="pl-5.5">
+                                <p className="text-[11px] text-neutral-400 font-mono leading-relaxed truncate opacity-80">
+                                    {statusDetail || displayStatus}
+                                </p>
+                            </div>
+                        )}
+
+                        {/* Bottom Thin Progress Bar */}
+                        <div className="mt-2 h-1 w-full bg-white/5 rounded-full overflow-hidden">
+                            <motion.div
+                                className="h-full bg-blue-500 rounded-full"
+                                initial={{ width: "0%" }}
+                                animate={{ width: `${progress}%` }}
+                                transition={{ duration: 0.3 }}
+                            />
+                        </div>
                     </div>
                 </div>
             </motion.div>

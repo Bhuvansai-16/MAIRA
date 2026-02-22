@@ -4,17 +4,19 @@ load_dotenv()
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
 from langchain_anthropic import ChatAnthropic
-from langchain_aws import ChatBedrockConverse
 import os
-
-# AWS Credentials
-aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
-aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
 
 # =====================================================
 # AVAILABLE MODELS (for frontend model selector)
 # =====================================================
 AVAILABLE_MODELS = {
+    "gemini-3.1-pro-preview": {
+        "name": "Gemini 3.1 Pro",
+        "provider": "google",
+        "model_id": "models/gemini-3.1-pro-preview",
+        "category": "Most powerful at complex tasks",
+        "icon": "gemini"
+    },
     "gemini-3-pro-preview": {
         "name": "Gemini 3 Pro",
         "provider": "google",
@@ -27,6 +29,13 @@ AVAILABLE_MODELS = {
         "provider": "google",
         "model_id": "models/gemini-3-flash-preview",
         "category": "Fast and cost-efficient",
+        "icon": "gemini"
+    },
+    "gemini-2.5-pro": {
+        "name": "Gemini 2.5 Pro",
+        "provider": "google",
+        "model_id": "models/gemini-2.5-pro",
+        "category": "Versatile and highly intelligent",
         "icon": "gemini"
     },
     "gpt-oss-120b": {
@@ -49,20 +58,6 @@ AVAILABLE_MODELS = {
         "model_id": "claude-opus-4-6-20251101", # Hypothetical ID
         "category": "Most powerful at complex tasks",
         "icon": "anthropic"
-    },
-    "anthropic.claude-opus-4-6-v1": {
-        "name": "Claude Opus 4.6 AWS",
-        "provider": "aws",
-        "model_id": "global.anthropic.claude-opus-4-6-v1",
-        "category": "Most powerful at complex tasks",
-        "icon": "anthropic"
-    },
-    "anthropic.claude-opus-4-5-v1": {
-        "name": "Claude Opus 4.5 AWS",
-        "provider": "aws",
-        "model_id": "global.anthropic.claude-opus-4-5-v1", # Hypothetical ID
-        "category": "Most powerful at complex tasks",
-        "icon": "anthropic"
     }
 }
 
@@ -76,67 +71,24 @@ _current_model_key = DEFAULT_MODEL
 # =====================================================
 
 # Google Models (max_retries for transient 500 errors)
-gemini_3_pro = ChatGoogleGenerativeAI(model="models/gemini-3-pro-preview", temperature=0, max_retries=3)
-gemini_3_flash = ChatGoogleGenerativeAI(model="models/gemini-3-flash-preview", temperature=0, max_retries=3)
-gemini_2_5_pro = ChatGoogleGenerativeAI(model="models/gemini-2.5-pro", temperature=0, max_retries=3)
-gemini_2_5_flash_lite = ChatGoogleGenerativeAI(model="models/gemini-2.5-flash-lite", temperature=0, max_retries=3)
-gemini_2_flash = ChatGoogleGenerativeAI(model="models/gemini-2.0-flash", temperature=0, max_retries=3)
+gemini_3_1_pro = ChatGoogleGenerativeAI(model="models/gemini-3.1-pro-preview", temperature=0, max_retries=3,timeout=90.0)
+gemini_3_pro = ChatGoogleGenerativeAI(model="models/gemini-3-pro-preview", temperature=0, max_retries=3,timeout=90.0)
+gemini_3_flash = ChatGoogleGenerativeAI(model="models/gemini-3-flash-preview", temperature=0, max_retries=3,timeout=90.0)
+gemini_2_5_pro = ChatGoogleGenerativeAI(model="models/gemini-2.5-pro", temperature=0, max_retries=3,timeout=90.0)
+gemini_2_5_flash_lite = ChatGoogleGenerativeAI(model="models/gemini-2.5-flash-lite", temperature=0, max_retries=3,timeout=90.0)
+gemini_2_flash = ChatGoogleGenerativeAI(model="models/gemini-2.0-flash", temperature=0, max_retries=3,timeout=90.0)
 
 # Groq Models
-llama_70b = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
-llama_8b = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
-gpt_oss_120b = ChatGroq(model="openai/gpt-oss-120b", temperature=0)
-kimi_k2 = ChatGroq(model="moonshotai/kimi-k2-instruct-0905", temperature=0)
+llama_70b = ChatGroq(model="llama-3.3-70b-versatile", temperature=0,timeout=90.0)
+llama_8b = ChatGroq(model="llama-3.1-8b-instant", temperature=0,timeout=90.0)
+gpt_oss_120b = ChatGroq(model="openai/gpt-oss-120b", temperature=0,timeout=90.0)
+kimi_k2 = ChatGroq(model="moonshotai/kimi-k2-instruct-0905", temperature=0,timeout=90.0)
 
 # Anthropic Direct Models
-claude_opus_4_5 = ChatAnthropic(model="claude-opus-4-5-20251101", temperature=0.2)
-claude_opus_4_6 = ChatAnthropic(model="claude-opus-4-6-20251101", temperature=0.2) # New
-claude_sonnet_4_5 = ChatAnthropic(model="claude-sonnet-4-5-20250929", temperature=0.2)
-
-from botocore.config import Config # Add this import
-
-# Define a robust config for long-running research tasks
-bedrock_research_config = Config(
-    read_timeout=600,       # 10 minutes for complex reasoning
-    connect_timeout=60,
-    retries={'max_attempts': 3}
-)
-# AWS Bedrock Models
-claude_3_5_sonnet_aws = ChatBedrockConverse(
-    model_id="anthropic.claude-3-5-sonnet-20240620-v1:0",
-    region_name="us-east-1",
-    aws_access_key_id=aws_access_key_id,
-    aws_secret_access_key=aws_secret_access_key,
-    temperature=0.2,
-    config=bedrock_research_config  # Use the robust config for research tasks
-)
-
-claude_sonnet_4_5_aws = ChatBedrockConverse(
-    model_id="global.anthropic.claude-sonnet-4-5-20250929-v1:0",
-    region_name="us-east-1",
-    aws_access_key_id=aws_access_key_id,
-    aws_secret_access_key=aws_secret_access_key,
-    temperature=0.2,
-    config=bedrock_research_config  # Use the robust config for research tasks
-)
-
-claude_opus_4_6_aws = ChatBedrockConverse(
-    model_id="global.anthropic.claude-opus-4-6-v1",
-    region_name="us-east-1",
-    aws_access_key_id=aws_access_key_id,
-    aws_secret_access_key=aws_secret_access_key,
-    temperature=0.2,
-    config=bedrock_research_config  # Use the robust config for research tasks
-)
-
-claude_opus_4_5_aws = ChatBedrockConverse(
-    model_id="global.anthropic.claude-opus-4-5-v1",
-    region_name="us-east-1",
-    aws_access_key_id=aws_access_key_id,
-    aws_secret_access_key=aws_secret_access_key,
-    temperature=0.2,
-    config=bedrock_research_config 
-)
+claude_opus_4_5 = ChatAnthropic(model="claude-opus-4-5", temperature=0,timeout=90.0)
+claude_opus_4_6 = ChatAnthropic(model="claude-opus-4-6", temperature=0,timeout=90.0) # New
+claude_sonnet_4_5 = ChatAnthropic(model="claude-sonnet-4-5", temperature=0,timeout=90.0)
+claude_sonnet_4_6 = ChatAnthropic(model="claude-sonnet-4-6", temperature=0,timeout=90.0)
 
 
 # =====================================================
@@ -156,14 +108,13 @@ def get_model_instance(model_key: str = None):
     # Simply use the pre-defined instances based on key mapping
     # This prevents creating new instances repeatedly
     key = model_key or _current_model_key
-    
+    if key == "gemini-3.1-pro-preview": return gemini_3_1_pro
     if key == "gemini-3-pro-preview": return gemini_3_pro
     if key == "gemini-3-flash-preview": return gemini_3_flash
+    if key == "gemini-2.5-pro": return gemini_2_5_pro
     if key == "gpt-oss-120b": return gpt_oss_120b
     if key == "claude-opus-4.5": return claude_opus_4_5
     if key == "claude-opus-4.6": return claude_opus_4_6
-    if key == "anthropic.claude-opus-4-6-v1": return claude_opus_4_6_aws
-    if key == "anthropic.claude-opus-4-5-v1": return claude_opus_4_5_aws
     
     # Fallback to creating new if needed (legacy behavior)
     config = AVAILABLE_MODELS.get(key, AVAILABLE_MODELS.get(DEFAULT_MODEL))
@@ -175,15 +126,7 @@ def get_model_instance(model_key: str = None):
     elif provider == "groq":
         return ChatGroq(model=model_id, temperature=0)
     elif provider == "anthropic":
-        return ChatAnthropic(model=model_id, temperature=0.2)
-    elif provider == "aws":
-        return ChatBedrockConverse(
-            model_id=model_id,
-            region_name="us-east-1",
-            aws_access_key_id=aws_access_key_id,
-            aws_secret_access_key=aws_secret_access_key,
-            temperature=0.2,
-        )
+        return ChatAnthropic(model=model_id, temperature=0)
     return gemini_3_pro
 
 
@@ -201,16 +144,19 @@ def set_current_model(model_key: str):
         # 1) If Gemini 3 Pro -> Subagent: Gemini 3 Flash
         if model_key == "gemini-3-pro-preview":
             subagent_model = gemini_3_flash
-            
-        # 2) If Opus 4.6 AWS or Opus 4.5 AWS -> Subagent: 4.5 Sonnet AWS
-        elif model_key in ["anthropic.claude-opus-4-6-v1", "anthropic.claude-opus-4-5-v1"]:
-            subagent_model = claude_sonnet_4_5_aws
-            
-        # 3) If Opus 4.6 or Opus 4.5 -> Subagent: 4.5 Sonnet
-        elif model_key in ["claude-opus-4.6", "claude-opus-4.5"]:
+        elif model_key == "gemini-3.1-pro-preview":
+            subagent_model = gemini_3_pro
+        elif model_key == "gemini-3-flash-preview":
+            subagent_model = gemini_3_flash
+        elif model_key == "gemini-2.5-pro":
+            subagent_model = gemini_3_flash    
+        # 2) If Opus 4.6 or Opus 4.5 -> Subagent: 4.5 Sonnet
+        elif model_key in ["claude-opus-4.6"]:
+            subagent_model = claude_sonnet_4_6
+        elif model_key in ["claude-opus-4.5"]:
             subagent_model = claude_sonnet_4_5
             
-        # 4) If GPT OSS 120B -> Subagent: LLaMA 3.3 70B
+        # 3) If GPT OSS 120B -> Subagent: LLaMA 3.3 70B
         elif model_key == "gpt-oss-120b":
             subagent_model = llama_70b
             

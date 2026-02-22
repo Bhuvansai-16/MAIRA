@@ -92,6 +92,8 @@ def get_downloads_from_supabase(thread_id: str) -> List[Dict[str, Any]]:
 
     try:
         files = storage.list_files(buckets["exports"], thread_id)
+        # Sort files by name in reverse order (latest timestamp first)
+        files.sort(key=lambda x: x.get("name", ""), reverse=True)
         results = []
         for f in files:
             name = f.get("name", "")

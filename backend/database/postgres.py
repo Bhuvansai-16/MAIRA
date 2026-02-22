@@ -10,6 +10,7 @@ Handles:
 import os
 import threading
 import functools
+import json
 import time as _time
 from dotenv import load_dotenv
 from psycopg_pool import ConnectionPool
@@ -18,6 +19,14 @@ from langgraph.checkpoint.memory import MemorySaver
 from psycopg.rows import dict_row
 
 load_dotenv()
+
+try:
+    from ..redis_client import redis_client
+except ImportError:
+    # Handle direct execution or different path structure
+    import sys
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from redis_client import redis_client
 
 # =====================================================
 # SUPABASE CONNECTION CONFIG
@@ -33,9 +42,9 @@ DB_URI = (
     f"?sslmode=require"
     f"&connect_timeout=10"         # Fail fast on unreachable server
     f"&keepalives=1"               # Enable TCP keepalive
-    f"&keepalives_idle=20"         # Start probing after 20s idle (was 30)
-    f"&keepalives_interval=5"      # Probe every 5s (was 10)
-    f"&keepalives_count=3"         # Give up after 3 failed probes (was 5)
+    f"&keepalives_idle=10"         # Start probing after 10s idle (was 20)
+    f"&keepalives_interval=3"      # Probe every 3s (was 5)
+    f"&keepalives_count=5"         # Give up after 5 failed probes (was 3)
     f"&tcp_user_timeout=30000"     # 30s TCP-level timeout (ms)
 )
 
@@ -45,8 +54,8 @@ DB_URI = (
 # =====================================================
 POOL_CONFIG = dict(
     conninfo=DB_URI,
-    min_size=1,
-    max_size=2,             # Reduced from 3: CRUD ops are fast, save connection budget
+    min_size=2,          # Increased from 1
+    max_size=15,         # INCREASED from 2
     open=False,
     max_idle=45,            # Close idle connections after 45s (was 60)
     max_lifetime=240,       # Recycle every 4 min (was 5 min)
@@ -64,12 +73,12 @@ pool = ConnectionPool(**POOL_CONFIG)
 # Well within Supabase free-tier ~20 connection limit
 CHECKPOINTER_POOL_CONFIG = dict(
     conninfo=DB_URI,
-    min_size=1,
-    max_size=2,             # Reduced from 3: trimmed checkpoints need less parallelism
+    min_size=2,          # Increased from 1
+    max_size=15,         # INCREASED from 2
     open=False,
-    max_idle=20,            # Close idle after 20s (was 30) — faster SSL recycle
-    max_lifetime=120,       # Recycle every 2 min (was 3 min) — prevent stale SSL sessions
-    reconnect_timeout=30,
+    max_idle=15,            # Close idle after 15s — faster SSL recycle
+    max_lifetime=90,        # Recycle every 90s — prevent stale SSL sessions
+    reconnect_timeout=20,   # Faster reconnect timeout
     num_workers=2,
     check=ConnectionPool.check_connection,
 )
@@ -89,12 +98,11 @@ _fallback_checkpointer = None
 # =====================================================
 
 def open_all_pools():
-    """
-    Open both the CRUD pool and the checkpointer pool.
-    Call once at startup (from main_agent.py).
-    """
-    pool.open()
-    _checkpointer_pool.open()
+    """ Open both pools. Safe to call multiple times. """
+    if pool.closed:
+        pool.open()
+    if _checkpointer_pool.closed:
+        _checkpointer_pool.open()
     print("✅ All PostgreSQL connection pools opened")
 
 
@@ -126,13 +134,21 @@ def reset_checkpointer_pool():
     with _pool_lock:
         old_pool = _checkpointer_pool
         try:
-            old_pool.close(timeout=5)
+            old_pool.close(timeout=3)  # Faster timeout
         except Exception:
             pass
         
         _checkpointer_pool = ConnectionPool(**CHECKPOINTER_POOL_CONFIG)
         _checkpointer_pool.open()
-        print("🔄 Checkpointer pool reset successfully")
+        
+        # Warm up the pool with a test query to establish fresh SSL connection
+        try:
+            with _checkpointer_pool.connection(timeout=5) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+            print("🔄 Checkpointer pool reset and warmed up successfully")
+        except Exception as e:
+            print(f"🔄 Checkpointer pool reset (warmup failed: {e})")
 
 
 def validate_pool() -> bool:
@@ -141,12 +157,39 @@ def validate_pool() -> bool:
     Returns True if healthy, False otherwise.
     """
     try:
+        if pool.closed:
+            print("⚠️ Health check: CRUD pool is closed, resetting...")
+            reset_pool()
+            return False
         with pool.connection(timeout=5) as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
         return True
     except Exception as e:
         print(f"⚠️ Pool validation failed: {e}")
+        return False
+
+
+def validate_checkpointer_pool() -> bool:
+    """Health check for the checkpointer pool."""
+    global _checkpointer_pool
+    try:
+        if _checkpointer_pool.closed:
+            print("⚠️ Health check: checkpointer pool is closed, resetting...")
+            reset_checkpointer_pool()
+            return False
+        with _checkpointer_pool.connection(timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        return True
+    except Exception as e:
+        print(f"⚠️ Health check: checkpointer pool failed: {e}")
+        # Auto-recover instead of just reporting
+        try:
+            reset_checkpointer_pool()
+            print("✅ Checkpointer pool auto-recovered")
+        except Exception as re:
+            print(f"❌ Checkpointer pool recovery failed: {re}")
         return False
 
 
@@ -166,11 +209,23 @@ def ensure_healthy_pool():
 def _is_transient_error(error_msg: str) -> bool:
     """Check if an error message indicates a transient DB/SSL failure."""
     markers = [
-        "ssl", "bad length", "eof detected",
+        # SSL-specific errors
+        "ssl", "bad length", "eof detected", "ssl_read", "ssl_write",
+        "sslv3 alert", "tls", "certificate", "handshake",
+        # Connection errors
         "server closed", "broken pipe", "connection reset",
         "no connection", "could not connect", "connection refused",
         "connection timed out", "network", "timeout",
-        "operational error", "interface error",
+        "connection unexpectedly closed", "server unexpectedly closed",
+        # Pool errors
+        "pool is closed", "pool exhausted", "connection is closed",
+        "cannot allocate", "pool timeout",
+        # psycopg/database errors
+        "operational error", "interface error", "database error",
+        "query was cancelled", "terminating connection",
+        "the connection is closed", "connection has been closed",
+        # Supabase-specific
+        "pgbouncer", "too many connections", "max_connections",
     ]
     lower = error_msg.lower()
     return any(m in lower for m in markers)
@@ -209,31 +264,24 @@ def with_db_retry(max_retries: int = 2, base_delay: float = 0.5):
 # CHECKPOINTER & STORE
 # =====================================================
 
-@with_db_retry(max_retries=3, base_delay=1.0)
 def get_checkpointer() -> PostgresSaver:
     """
-    Returns a ready-to-use sync checkpointer backed by its own dedicated pool.
-    This pool is never reset during streaming, so background threads can
-    always save checkpoints safely.
-    
-    setup() is idempotent - safe to call on every initialization.
-    Falls back to MemorySaver if PostgreSQL connection fails.
+    Always return a fresh PostgresSaver bound to the CURRENT _checkpointer_pool.
+    Never cache this — pools can be reset at any time.
     """
-    global _fallback_checkpointer
+    global _checkpointer_pool, _fallback_checkpointer
     
-    try:
-        # Test the checkpointer pool health
-        with _checkpointer_pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
+    if _checkpointer_pool.closed:
+        print("⚠️ Checkpointer pool was closed, reopening...")
+        reset_checkpointer_pool()
         
-        checkpointer = PostgresSaver(_checkpointer_pool)
-        checkpointer.setup()
-        print("✅ PostgresSaver checkpointer ready (dedicated pool)")
-        return checkpointer
+    try:
+        saver = PostgresSaver(_checkpointer_pool)
+        saver.setup()
+        # print("✅ PostgresSaver checkpointer ready (dedicated pool)")
+        return saver
     except Exception as e:
-        print(f"⚠️ PostgreSQL checkpointer failed: {e}")
-        print("   Falling back to in-memory checkpointer (state won't persist across restarts)")
+        print(f"⚠️ PostgresSaver init failed, falling back to MemorySaver: {e}")
         if _fallback_checkpointer is None:
             _fallback_checkpointer = MemorySaver()
         return _fallback_checkpointer
@@ -244,14 +292,14 @@ def get_store():
     """
     Returns a persistent store for long-term memory.
     Uses the dedicated checkpointer pool (never reset during streaming).
-    
-    This store persists data across:
-    - Multiple conversation threads
-    - Server restarts
-    - Different user sessions
-    
-    The table schema will be auto-fixed on startup if columns are missing.
     """
+    global _checkpointer_pool
+    
+    # Ensure pool is open
+    if _checkpointer_pool.closed:
+        print("⚠️ Store pool was closed, reopening...")
+        reset_checkpointer_pool()
+        
     from langgraph.store.postgres import PostgresStore
     store = PostgresStore(_checkpointer_pool)
     
@@ -640,6 +688,13 @@ def create_custom_persona(user_id: str, name: str, instructions: str) -> dict | 
     except Exception as e:
         print(f"⚠️ Error creating custom persona: {e}")
         return None
+    finally:
+        # Invalidate cache safely
+        if redis_client:
+            try:
+                redis_client.delete(f"personas:{user_id}")
+            except Exception as e:
+                print(f"⚠️ Cache invalidation failed: {e}")
 
 
 @with_db_retry()
@@ -648,6 +703,17 @@ def get_custom_personas(user_id: str) -> list[dict]:
     Get all active custom personas for a user.
     Returns list of persona dicts sorted by creation time.
     """
+    # 1. Check Redis cache
+    cache_key = f"personas:{user_id}"
+    if redis_client:
+        try:
+            cached = redis_client.get(cache_key)
+            if cached:
+                print(f"⚡ Cache HIT for personas: {user_id}")
+                return json.loads(cached)
+        except Exception as e:
+            print(f"⚠️ Redis persona cache error: {e}")
+
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
@@ -670,6 +736,14 @@ def get_custom_personas(user_id: str) -> list[dict]:
                         "created_at": row[3].isoformat() if row[3] else None
                     })
                 print(f"👤 Found {len(personas)} custom personas for user {user_id}")
+                
+                # 2. Cache results
+                if redis_client:
+                    try:
+                        redis_client.setex(cache_key, 3600, json.dumps(personas))
+                    except Exception as e:
+                        print(f"⚠️ Failed to cache personas: {e}")
+                
                 return personas
     except Exception as e:
         print(f"⚠️ Error fetching custom personas: {e}")
@@ -714,6 +788,13 @@ def update_custom_persona(persona_id: str, user_id: str, name: str = None, instr
     except Exception as e:
         print(f"⚠️ Error updating custom persona: {e}")
         return False
+    finally:
+        # Invalidate cache safely
+        if redis_client:
+            try:
+                redis_client.delete(f"personas:{user_id}")
+            except Exception as e:
+                print(f"⚠️ Cache invalidation failed: {e}")
 
 
 @with_db_retry()
@@ -743,6 +824,13 @@ def delete_custom_persona(persona_id: str, user_id: str) -> bool:
     except Exception as e:
         print(f"⚠️ Error deleting custom persona: {e}")
         return False
+    finally:
+        # Invalidate cache safely
+        if redis_client:
+            try:
+                redis_client.delete(f"personas:{user_id}")
+            except Exception as e:
+                print(f"⚠️ Cache invalidation failed: {e}")
 
 
 # =====================================================
@@ -755,6 +843,17 @@ def get_user_sites(user_id: str) -> list[str]:
     Get all saved sites for a user.
     Returns a list of URL strings.
     """
+    # 1. Check Redis cache
+    cache_key = f"sites:{user_id}"
+    if redis_client:
+        try:
+            cached = redis_client.get(cache_key)
+            if cached:
+                print(f"⚡ Cache HIT for sites: {user_id}")
+                return json.loads(cached)
+        except Exception as e:
+            print(f"⚠️ Redis sites cache error: {e}")
+
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
@@ -769,6 +868,14 @@ def get_user_sites(user_id: str) -> list[str]:
                 rows = cur.fetchall()
                 sites = [row[0] for row in rows]
                 print(f"🌐 Found {len(sites)} saved sites for user {user_id}")
+                
+                # 2. Cache results
+                if redis_client:
+                    try:
+                        redis_client.setex(cache_key, 3600, json.dumps(sites))
+                    except Exception as e:
+                        print(f"⚠️ Failed to cache sites: {e}")
+                
                 return sites
     except Exception as e:
         print(f"⚠️ Error fetching user sites: {e}")
@@ -806,6 +913,13 @@ def set_user_sites(user_id: str, urls: list[str]) -> bool:
     except Exception as e:
         print(f"⚠️ Error saving user sites: {e}")
         return False
+    finally:
+        # Invalidate cache safely
+        if redis_client:
+            try:
+                redis_client.delete(f"sites:{user_id}")
+            except Exception as e:
+                print(f"⚠️ Cache invalidation failed: {e}")
 
 
 @with_db_retry()
@@ -829,6 +943,13 @@ def add_user_site(user_id: str, url: str) -> bool:
     except Exception as e:
         print(f"⚠️ Error adding user site: {e}")
         return False
+    finally:
+        # Invalidate cache safely
+        if redis_client:
+            try:
+                redis_client.delete(f"sites:{user_id}")
+            except Exception as e:
+                print(f"⚠️ Cache invalidation failed: {e}")
 
 
 @with_db_retry()
@@ -851,4 +972,11 @@ def remove_user_site(user_id: str, url: str) -> bool:
     except Exception as e:
         print(f"⚠️ Error removing user site: {e}")
         return False
+    finally:
+        # Invalidate cache safely
+        if redis_client:
+            try:
+                redis_client.delete(f"sites:{user_id}")
+            except Exception as e:
+                print(f"⚠️ Cache invalidation failed: {e}")
 

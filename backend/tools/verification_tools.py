@@ -25,8 +25,8 @@ except Exception as e:
     print(f"⚠️ Tavily client initialization warning: {e}")
     tavily_client = None
 
-# Thread pool for async operations
-executor = ThreadPoolExecutor(max_workers=10)
+# Thread pool for async operations — Increased for parallel fact-checking
+executor = ThreadPoolExecutor(max_workers=50)
 
 
 # =============================================================================

@@ -2,7 +2,7 @@
 
 from .searchtool import internet_search
 from .extracttool import extract_webpage
-from .arxivertool import arxiv_tool, arxiv_search  # arxiv_search has rate limiting
+from .arxivertool import arxiv_search  # arxiv_search has rate limiting
 from .pdftool import export_to_pdf
 from .doctool import export_to_docx
 from .latextoformate import convert_latex_to_all_formats

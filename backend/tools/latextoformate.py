@@ -12,27 +12,29 @@ import os
 from datetime import datetime
 from langchain.tools import tool
 
-# Thread-safe storage for download data from subagent tool calls
-# Uses a global latest-download approach instead of thread IDs because
-# LangGraph runs tools via asyncio.run_in_executor() in a thread pool,
-# so the storing thread ID differs from the retrieving thread ID.
-_latest_download = None
+# Thread-safe storage for pending downloads indexed by filename
+_pending_downloads = {}
 _download_lock = threading.Lock()
 
 def _store_pending_download(data: dict):
-    """Store download data globally (latest wins)."""
-    global _latest_download
+    """Store download data globally (indexed by filename)."""
+    global _pending_downloads
     with _download_lock:
-        _latest_download = data
-        print(f"  💾 Download stored in pending: {data.get('filename', 'unknown')}")
+        if filename := data.get('filename'):
+            _pending_downloads[filename] = data
+            print(f"  💾 [latextoformate] Download stored in pending: {filename}")
 
-def get_pending_download() -> dict | None:
-    """Retrieve and remove the latest pending download data."""
-    global _latest_download
+def get_pending_download(filename: str = None) -> dict | None:
+    """Retrieve and remove pending download data by filename."""
+    global _pending_downloads
     with _download_lock:
-        data = _latest_download
-        _latest_download = None
-        return data
+        if filename:
+            return _pending_downloads.pop(filename, None)
+        # Fallback to latest for legacy calls (if any)
+        if _pending_downloads:
+            latest_key = list(_pending_downloads.keys())[-1]
+            return _pending_downloads.pop(latest_key)
+        return None
 
 @tool
 def convert_latex_to_pdf(latex_string: str, output_filename: str) -> str:
@@ -191,8 +193,9 @@ def convert_latex_to_pdf(latex_string: str, output_filename: str) -> str:
             )
 
             # Step 2: Fix Table Wrapping (Longtable to p-columns)
+            # Uses [lcr\|]+ to aggressively catch ANY column alignment Pandoc generates
             tex_content = re.sub(
-                r'\\begin\{longtable\}\[\]\{@\{\}lll@\{\}\}',
+                r'\\begin\{longtable\}\[\]\{@\{\}[lcr\|]+@\{\}\}',
                 r'\\begin{longtable}[]{@{}p{0.25\\linewidth}p{0.34\\linewidth}p{0.34\\linewidth}@{}}',
                 tex_content
             )
@@ -486,7 +489,7 @@ def convert_latex_to_all_formats(latex_string: str, output_filename: str) -> str
     # Note: Each tool above calls _store_pending_download() internally.
     # The PDF tool runs first, so the PDF download is stored.
     # The later tools overwrite it, so let's restore the PDF as primary.
-    # We do this by re-reading from _latest_download — if the last stored was MD,
+    # We do this by re-reading from _pending_downloads — if the last stored was MD,
     # that's fine because individual tools already stored the data.
     # The backend fallback will pick up whatever was last stored.
     

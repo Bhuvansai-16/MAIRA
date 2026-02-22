@@ -1,9 +1,9 @@
 import { useState, memo } from 'react';
 import { cn } from "../lib/utils";
-import { User, Shield, FileDown, Pencil, Check, X, Copy, CheckCircle2, ChevronLeft, ChevronRight, FileText } from "lucide-react";
+import { FileDown, Pencil, Check, X, Copy, CheckCircle2, FileText, Image as ImageIcon, RotateCcw } from "lucide-react";
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion } from 'framer-motion';
 import { toast } from 'sonner';
 import { BranchSwitcher } from './BranchSwitcher';
 import { VerificationScore } from './VerificationScore';
@@ -30,22 +30,24 @@ interface MessageBubbleProps {
     totalVersions?: number;
     currentVersionIndex?: number;
     onVersionChange?: (messageIndex: number, versionIndex: number) => void;
+    onRetry?: (index: number) => void;
 }
 
-export const MessageBubble = memo(({ 
-    role, 
-    content, 
-    status, 
+export const MessageBubble = memo(({
+    role,
+    content,
+    status,
     reasoning,
     messageIndex,
     attachments,
-    download, 
+    download,
     verification,
     onEdit,
     isStreaming = false,
     totalVersions = 1,
     currentVersionIndex = 0,
-    onVersionChange
+    onVersionChange,
+    onRetry
 }: MessageBubbleProps) => {
     const [isEditing, setIsEditing] = useState(false);
     const [editContent, setEditContent] = useState(content);
@@ -86,7 +88,7 @@ export const MessageBubble = memo(({
     const handleDownload = (e: React.MouseEvent) => {
         e.preventDefault(); // Prevent default button behavior
         e.stopPropagation(); // Prevent bubbling
-        
+
         if (!download || !download.data) {
             console.error("Download data is missing");
             alert("Download failed: No data available.");
@@ -101,7 +103,7 @@ export const MessageBubble = memo(({
         try {
             // Clean base64 string - remove data URI prefix, whitespace, and newlines
             let base64Data = download.data.replace(/^data:.*,/, '').replace(/\s+/g, '').trim();
-            
+
             // Validate base64 characters (should only contain A-Z, a-z, 0-9, +, /, =)
             const validBase64Regex = /^[A-Za-z0-9+/]*={0,2}$/;
             if (!validBase64Regex.test(base64Data)) {
@@ -111,7 +113,7 @@ export const MessageBubble = memo(({
                 alert(`Download failed: Invalid base64 encoding. Found invalid characters: ${invalidChars?.join(', ')}`);
                 return;
             }
-            
+
             // Validate base64 string length (must be multiple of 4)
             if (base64Data.length % 4 !== 0) {
                 console.warn("Base64 string length is not multiple of 4, padding...");
@@ -137,17 +139,17 @@ export const MessageBubble = memo(({
                 : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 
             const blob = new Blob([byteArray], { type: mimeType });
-            
+
             // Create download link
             const url = window.URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.style.display = 'none';
             a.href = url;
             a.download = download.filename;
-            
+
             document.body.appendChild(a);
             a.click();
-            
+
             // Cleanup
             window.setTimeout(() => {
                 document.body.removeChild(a);
@@ -183,38 +185,25 @@ export const MessageBubble = memo(({
                 role === "user" ? "flex-row-reverse" : "flex-row"
             )}
         >
-            {/* Avatar with version indicator */}
-            <div className="flex flex-col items-center gap-2">
-                <div
-                    className={cn(
-                        "flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border-2 shadow-xl ring-offset-2 ring-offset-black transition-all group-hover:scale-110",
-                        role === "user"
-                            ? "border-blue-600/30 bg-blue-600 text-white ring-blue-600/20"
-                            : "border-white/10 bg-[#121212] text-white ring-white/10"
-                    )}
-                >
-                    {role === "user" ? <User size={18} strokeWidth={2.5} /> : <Shield size={18} strokeWidth={2.5} className="text-blue-500" />}
+            {/* Version Navigation - only show for user messages with multiple versions */}
+            {role === "user" && hasMultipleVersions && !isEditing && (
+                <div className="flex flex-col items-center gap-2">
+                    <BranchSwitcher
+                        currentVersion={currentVersionIndex}
+                        totalVersions={totalVersions}
+                        onPrevious={handlePrevVersion}
+                        onNext={handleNextVersion}
+                    />
                 </div>
-                
-                {/* Version Navigation - only show for user messages with multiple versions */}
-                {role === "user" && hasMultipleVersions && !isEditing && (
-                    <div className="ml-2">
-                        <BranchSwitcher 
-                            currentVersion={currentVersionIndex}
-                            totalVersions={totalVersions}
-                            onPrevious={handlePrevVersion}
-                            onNext={handleNextVersion}
-                        />
-                    </div>
-                )}
-            </div>
+            )}
 
             <div
                 className={cn(
-                    "flex max-w-[85%] flex-col gap-3 rounded-[24px] px-6 py-5 text-sm transition-all duration-300 relative",
+                    "flex flex-col gap-3 rounded-[24px] px-6 py-5 text-sm transition-all duration-300 relative",
+                    role === "user" ? "max-w-[85%]" : "w-full",
                     role === "user"
-                        ? "bg-white text-black font-semibold shadow-2xl shadow-white/5 rounded-tr-sm"
-                        : "bg-[#121212] border border-white/5 text-[#e5e5e5] rounded-tl-sm hover:border-white/10 shadow-2xl shadow-black/50"
+                        ? "bg-[#1A1A1A] text-white font-semibold shadow-2xl shadow-white/5 rounded-tr-sm border border-white/10"
+                        : "bg-[#121212] border border-white/5 text-[#e5e5e5] rounded-tl-sm hover:border-white/10 shadow-lg dark:shadow-2xl shadow-black/50"
                 )}
             >
                 {/* Edit Button for user messages */}
@@ -231,6 +220,17 @@ export const MessageBubble = memo(({
                     </button>
                 )}
 
+                {/* Retry Button for agent messages */}
+                {role === "agent" && onRetry && messageIndex !== undefined && !isStreaming && (
+                    <button
+                        onClick={() => onRetry(messageIndex)}
+                        className="absolute -right-10 top-4 p-2 rounded-lg opacity-0 group-hover:opacity-100 hover:bg-white/10 text-neutral-500 hover:text-white transition-all"
+                        title="Retry / Regenerate"
+                    >
+                        <RotateCcw size={14} />
+                    </button>
+                )}
+
                 {/* Editing UI */}
                 {isEditing && role === "user" ? (
                     <div className="flex flex-col gap-3">
@@ -243,7 +243,7 @@ export const MessageBubble = memo(({
                             autoFocus
                         />
                         <div className="flex justify-center gap-2 mt-2">
-                             <button
+                            <button
                                 onClick={handleCancelEdit}
                                 className="px-4 py-2 rounded-full text-xs font-bold text-neutral-500 hover:text-black hover:bg-neutral-100 transition-all"
                             >
@@ -299,9 +299,9 @@ export const MessageBubble = memo(({
 
                         {/* Reasoning Block - shows agent's thinking process */}
                         {reasoning && role === 'agent' && (
-                            <ReasoningBlock 
-                                content={reasoning} 
-                                isStreaming={isStreaming && !displayContent}
+                            <ReasoningBlock
+                                content={reasoning}
+                                isStreaming={isStreaming}
                             />
                         )}
 
@@ -319,8 +319,9 @@ export const MessageBubble = memo(({
                             "prose-table:border-collapse prose-table:w-full prose-table:my-4 prose-table:text-sm",
                             "prose-th:border prose-th:border-white/10 prose-th:p-2 prose-th:bg-white/5 prose-th:text-left",
                             "prose-td:border prose-td:border-white/10 prose-td:p-2",
-                            "prose-img:rounded-xl prose-img:shadow-lg",
-                            role === "user" && "prose-p:text-black prose-strong:text-black prose-invert-none prose-headings:text-black"
+                            "prose-img:rounded-xl prose-img:shadow-lg prose-img:max-w-[480px] prose-img:max-h-[320px] prose-img:object-contain prose-img:mx-auto prose-img:block",
+                            role === "user" && "prose-p:text-black prose-strong:text-black prose-invert-none prose-headings:text-black",
+                            role === "agent" && "prose-p:text-black dark:prose-p:text-neutral-300 prose-strong:text-black dark:prose-strong:text-white prose-headings:text-black dark:prose-headings:text-white prose-li:text-black dark:prose-li:text-neutral-300"
                         )}>
                             {/* Copy button for agent messages */}
                             {role === 'agent' && displayContent && (
@@ -332,19 +333,18 @@ export const MessageBubble = memo(({
                                     {copied ? <CheckCircle2 size={14} className="text-green-500" /> : <Copy size={14} />}
                                 </button>
                             )}
-                            
+
                             {displayContent ? (
-                                <ReactMarkdown 
+                                <ReactMarkdown
                                     remarkPlugins={[remarkGfm]}
                                     components={{
-                                        // Custom link component to open in new tab and style differently if citation
                                         a: ({ node: _node, ...props }) => {
                                             // _node unused
                                             const isCitation = props.href?.includes('#citation');
                                             return (
-                                                <a 
-                                                    {...props} 
-                                                    target="_blank" 
+                                                <a
+                                                    {...props}
+                                                    target="_blank"
                                                     rel="noopener noreferrer"
                                                     className={cn(
                                                         props.className,
@@ -354,7 +354,20 @@ export const MessageBubble = memo(({
                                                     {props.children}
                                                 </a>
                                             );
-                                        }
+                                        },
+                                        img: ({ node: _node, src, alt, ...props }) => (
+                                            <span className="block my-3 text-center">
+                                                <img
+                                                    src={src}
+                                                    alt={alt || ''}
+                                                    {...props}
+                                                    style={{ maxWidth: '600px', maxHeight: '400px', objectFit: 'contain', borderRadius: '12px', boxShadow: '0 4px 24px rgba(0,0,0,0.3)', display: 'inline-block' }}
+                                                />
+                                                {alt && (
+                                                    <span className="block text-[11px] text-neutral-500 italic mt-1.5">{alt}</span>
+                                                )}
+                                            </span>
+                                        ),
                                     }}
                                 >
                                     {displayContent}
@@ -362,7 +375,7 @@ export const MessageBubble = memo(({
                             ) : (
                                 !status && !reasoning && !download && (
                                     <div className="flex items-center gap-2 text-neutral-500 italic">
-                                        <motion.span 
+                                        <motion.span
                                             animate={{ opacity: [0.4, 1, 0.4] }}
                                             transition={{ repeat: Infinity, duration: 1.5 }}
                                         >
@@ -378,8 +391,8 @@ export const MessageBubble = memo(({
                                 <button
                                     onClick={handleDownload}
                                     className={`group/dl relative flex w-full items-center justify-between gap-4 overflow-hidden rounded-2xl p-5 border transition-all duration-500 ${download.filename.toLowerCase().endsWith('.pdf')
-                                            ? 'bg-gradient-to-br from-red-600/10 to-rose-600/10 border-red-500/20 hover:border-red-500/40 hover:shadow-[0_0_30px_rgba(239,68,68,0.15)]'
-                                            : 'bg-gradient-to-br from-blue-600/10 to-purple-600/10 border-blue-500/20 hover:border-blue-500/40 hover:shadow-[0_0_30px_rgba(59,130,246,0.15)]'
+                                        ? 'bg-gradient-to-br from-red-600/10 to-rose-600/10 border-red-500/20 hover:border-red-500/40 hover:shadow-[0_0_30px_rgba(239,68,68,0.15)]'
+                                        : 'bg-gradient-to-br from-blue-600/10 to-purple-600/10 border-blue-500/20 hover:border-blue-500/40 hover:shadow-[0_0_30px_rgba(59,130,246,0.15)]'
                                         }`}
                                 >
                                     <div className={`absolute inset-0 bg-gradient-to-r to-transparent opacity-0 group-hover/dl:opacity-100 transition-opacity ${download.filename.toLowerCase().endsWith('.pdf') ? 'from-red-600/5' : 'from-blue-600/5'
@@ -387,8 +400,8 @@ export const MessageBubble = memo(({
 
                                     <div className="flex items-center gap-4 relative z-10">
                                         <div className={`flex h-12 w-12 items-center justify-center rounded-xl group-hover/dl:scale-110 group-hover/dl:text-white transition-all duration-500 active:scale-95 ${download.filename.toLowerCase().endsWith('.pdf')
-                                                ? 'bg-red-600/20 text-red-400 group-hover/dl:bg-red-600'
-                                                : 'bg-blue-600/20 text-blue-400 group-hover/dl:bg-blue-600'
+                                            ? 'bg-red-600/20 text-red-400 group-hover/dl:bg-red-600'
+                                            : 'bg-blue-600/20 text-blue-400 group-hover/dl:bg-blue-600'
                                             }`}>
                                             <FileDown size={24} />
                                         </div>
@@ -406,8 +419,8 @@ export const MessageBubble = memo(({
                                     </div>
 
                                     <div className={`relative z-10 flex h-10 w-10 items-center justify-center rounded-full border group-hover/dl:translate-x-1 transition-all ${download.filename.toLowerCase().endsWith('.pdf')
-                                            ? 'border-red-500/30 text-red-400 group-hover/dl:bg-red-600/20 group-hover/dl:border-red-500/50'
-                                            : 'border-blue-500/30 text-blue-400 group-hover/dl:bg-blue-600/20 group-hover/dl:border-blue-500/50'
+                                        ? 'border-red-500/30 text-red-400 group-hover/dl:bg-red-600/20 group-hover/dl:border-red-500/50'
+                                        : 'border-blue-500/30 text-blue-400 group-hover/dl:bg-blue-600/20 group-hover/dl:border-blue-500/50'
                                         }`}>
                                         <FileDown size={18} className="rotate-[-90deg]" />
                                     </div>
@@ -417,7 +430,7 @@ export const MessageBubble = memo(({
                         {/* Verification Score Display */}
                         {verification && role === 'agent' && (
                             <div className="mt-4 pt-4 border-t border-white/5">
-                                <VerificationScore 
+                                <VerificationScore
                                     verification={{
                                         overallScore: verification.overallScore,
                                         status: verification.status as VerificationStatus,
@@ -444,6 +457,6 @@ export const MessageBubble = memo(({
                         )}                    </>
                 )}
             </div>
-        </div>
+        </div >
     );
 });

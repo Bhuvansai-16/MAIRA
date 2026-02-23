@@ -34,9 +34,12 @@ SUPABASE_PROJECT_REF = (
 SUPABASE_PASSWORD = os.getenv("MAIRA_PASSWORD", "")
 
 # Connection string for PGVector (uses psycopg3 driver)
+# Fix #15: add SSL + TCP keepalive params to prevent stale connections
 VECTOR_DB_URI = (
     f"postgresql+psycopg://postgres:{SUPABASE_PASSWORD}"
     f"@db.{SUPABASE_PROJECT_REF}.supabase.co:5432/postgres"
+    f"?sslmode=require&connect_timeout=10&keepalives=1"
+    f"&keepalives_idle=10&keepalives_interval=3&keepalives_count=5"
 )
 
 # =====================================================
@@ -60,6 +63,11 @@ vector_store = PGVector(
 )
 
 print(f"✅ PGVector store initialized (collection: {COLLECTION_NAME})")
+
+# Fix #7: Module-level shared SQLAlchemy engine for direct SQL operations.
+# Reusing a single engine (with its own pool) avoids per-call engine creation.
+from sqlalchemy import create_engine as _create_engine
+_sql_engine = _create_engine(VECTOR_DB_URI, pool_size=2, max_overflow=1)
 
 # =====================================================
 # TEXT SPLITTER (for chunking documents)
@@ -223,6 +231,9 @@ def delete_user_documents(user_id: str) -> bool:
     Note: langchain-postgres PGVector doesn't natively support filtered delete,
     so this uses a direct SQL query.
 
+    Fix #7: Uses module-level _sql_engine (shared pool) instead of
+    creating a new engine per call.
+
     Args:
         user_id: The user whose documents to delete.
 
@@ -230,16 +241,14 @@ def delete_user_documents(user_id: str) -> bool:
         True if successful.
     """
     try:
-        from sqlalchemy import create_engine, text
-
-        engine = create_engine(VECTOR_DB_URI)
-        with engine.connect() as conn:
+        from sqlalchemy import text
+        with _sql_engine.connect() as conn:
             conn.execute(
                 text(
                     "DELETE FROM langchain_pg_embedding "
-                    "WHERE cmetadata->>'user_id' = :user_id"
+                    "WHERE cmetadata->>'user_id' = :uid"
                 ),
-                {"user_id": user_id},
+                {"uid": user_id},
             )
             conn.commit()
         print(f"🗑️ Deleted all documents for user {user_id}")

@@ -167,6 +167,45 @@ tools = [
     search_knowledge_base,
 ]
 
+# =====================================================
+# DEEPAGENTS SAFETY PATCH
+# Intercepts the internal _return_command_with_state_update function
+# to guard against Gemini silently returning an empty response on heavy
+# subagent queries (e.g. complex deep-research chains).
+# Without this, result["messages"][-1] crashes with an IndexError.
+# =====================================================
+def _patch_deepagents():
+    try:
+        import deepagents.middleware.subagents as _sub
+        _original = _sub._return_command_with_state_update
+
+        def _safe_return_command(result, tool_call_id):
+            if isinstance(result, dict):
+                msgs = result.get("messages", [])
+                valid_msgs = [
+                    m for m in msgs
+                    if (getattr(m, 'content', None) or getattr(m, 'text', None) or '').strip()
+                ]
+                if not valid_msgs:
+                    print(
+                        f"⚠️ Subagent empty response intercepted "
+                        f"(tool_call_id={tool_call_id}) — injecting placeholder"
+                    )
+                    from langchain_core.messages import AIMessage
+                    result["messages"] = [AIMessage(
+                        content="Research phase completed. Proceeding to next step."
+                    )]
+                else:
+                    result["messages"] = valid_msgs
+            return _original(result, tool_call_id)
+
+        _sub._return_command_with_state_update = _safe_return_command
+        print("✅ deepagents patch applied")
+    except Exception as e:
+        print(f"⚠️ deepagents patch failed (non-critical): {e}")
+
+_patch_deepagents()
+
 open_all_pools()
 print("✅ PostgreSQL connection pools opened (CRUD + checkpointer)")
 

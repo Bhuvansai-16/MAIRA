@@ -1,20 +1,22 @@
 
 import { motion } from 'framer-motion';
-import { XCircle, CheckCircle2, ShieldAlert, Zap, Globe, Brain, FileOutput } from 'lucide-react';
+import { XCircle, CheckCircle2, ShieldAlert, Zap, Globe, Brain, FileOutput, Sparkles } from 'lucide-react';
 
 export const Comparison = () => {
     const negatives = [
         "Hallucinates facts & makes up sources",
         "Loses context in complex research",
         "No real citations or verifiable data",
-        "Forces manual copy-pasting to Word"
+        "Forces manual copy-pasting to Word",
+        "Generic output with no personalization"
     ];
 
     const positives = [
         { text: "Autonomous web & arXiv scraping", icon: Globe },
         { text: "Fact-checking (Deep Reasoning)", icon: Brain },
         { text: "Verifiable citations for every claim", icon: CheckCircle2 },
-        { text: "Instant PDF/DOCX/LaTeX export", icon: FileOutput }
+        { text: "Instant PDF/DOCX/LaTeX export", icon: FileOutput },
+        { text: "Custom Personas for tailored research", icon: Sparkles }
     ];
 
     return (

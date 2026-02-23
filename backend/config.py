@@ -71,12 +71,22 @@ _current_model_key = DEFAULT_MODEL
 # =====================================================
 
 # Google Models (max_retries for transient 500 errors)
-gemini_3_1_pro = ChatGoogleGenerativeAI(model="models/gemini-3.1-pro-preview", temperature=0, max_retries=3,timeout=90.0)
-gemini_3_pro = ChatGoogleGenerativeAI(model="models/gemini-3-pro-preview", temperature=0, max_retries=3,timeout=90.0)
-gemini_3_flash = ChatGoogleGenerativeAI(model="models/gemini-3-flash-preview", temperature=0, max_retries=3,timeout=90.0)
-gemini_2_5_pro = ChatGoogleGenerativeAI(model="models/gemini-2.5-pro", temperature=0, max_retries=3,timeout=90.0)
-gemini_2_5_flash_lite = ChatGoogleGenerativeAI(model="models/gemini-2.5-flash-lite", temperature=0, max_retries=3,timeout=90.0)
-gemini_2_flash = ChatGoogleGenerativeAI(model="models/gemini-2.0-flash", temperature=0, max_retries=3,timeout=90.0)
+gemini_3_1_pro = ChatGoogleGenerativeAI(model="models/gemini-3.1-pro-preview", temperature=0, max_retries=3, timeout=90.0)
+gemini_3_pro = ChatGoogleGenerativeAI(model="models/gemini-3-pro-preview", temperature=0, max_retries=3, timeout=90.0)
+gemini_2_5_pro = ChatGoogleGenerativeAI(model="models/gemini-2.5-pro", temperature=0, max_retries=3, timeout=90.0)
+gemini_2_5_flash_lite = ChatGoogleGenerativeAI(model="models/gemini-2.5-flash-lite", temperature=0, max_retries=3, timeout=90.0)
+gemini_2_flash = ChatGoogleGenerativeAI(model="models/gemini-2.0-flash", temperature=0, max_retries=3, timeout=90.0)
+
+# Subagent-specific flash model — capped to prevent silent Gemini truncation on heavy queries.
+# max_output_tokens=8192 forces an explicit limit (no silent empty response).
+# timeout=180 gives long-running subagents enough time to finish.
+gemini_3_flash = ChatGoogleGenerativeAI(
+    model="models/gemini-3-flash-preview",
+    temperature=0,
+    max_retries=2,
+    timeout=180.0,
+    max_output_tokens=8192,
+)
 
 # Groq Models
 llama_70b = ChatGroq(model="llama-3.3-70b-versatile", temperature=0,timeout=90.0)
@@ -96,6 +106,7 @@ claude_sonnet_4_6 = ChatAnthropic(model="claude-sonnet-4-6", temperature=0,timeo
 # =====================================================
 
 main_agent_model = gemini_3_pro
+# subagent_model always uses the token-capped flash instance by default.
 subagent_model = gemini_3_flash
 
 
@@ -140,26 +151,21 @@ def set_current_model(model_key: str):
         # Update Main Agent
         main_agent_model = get_model_instance(model_key)
         
-        # Update Subagent Logic based on Main Agent
-        # 1) If Gemini 3 Pro -> Subagent: Gemini 3 Flash
-        if model_key == "gemini-3-pro-preview":
+        # Update Subagent Logic based on Main Agent.
+        # Gemini subagent models always use the token-capped gemini_3_flash instance.
+        # 1) Gemini main models → token-capped Flash subagent
+        if model_key in ("gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro"):
             subagent_model = gemini_3_flash
         elif model_key == "gemini-3.1-pro-preview":
-            subagent_model = gemini_3_pro
-        elif model_key == "gemini-3-flash-preview":
-            subagent_model = gemini_3_flash
-        elif model_key == "gemini-2.5-pro":
-            subagent_model = gemini_3_flash    
-        # 2) If Opus 4.6 or Opus 4.5 -> Subagent: 4.5 Sonnet
-        elif model_key in ["claude-opus-4.6"]:
+            subagent_model = gemini_3_pro  # Pro-level subagent for Pro-level main
+        # 2) Anthropic main → Sonnet subagent
+        elif model_key == "claude-opus-4.6":
             subagent_model = claude_sonnet_4_6
-        elif model_key in ["claude-opus-4.5"]:
+        elif model_key == "claude-opus-4.5":
             subagent_model = claude_sonnet_4_5
-            
-        # 3) If GPT OSS 120B -> Subagent: LLaMA 3.3 70B
+        # 3) Groq main → LLaMA subagent
         elif model_key == "gpt-oss-120b":
             subagent_model = llama_70b
-            
         # Default fallback
         else:
             subagent_model = gemini_3_flash

@@ -17,14 +17,24 @@ def get_redis_client():
         return None
 
     try:
-        redis_client = Redis(url=url, token=token)
+        client = Redis(url=url, token=token)
         # Test connection
-        redis_client.ping()
+        client.ping()
         print("✅ Redis connection established")
-        return redis_client
+        return client
     except Exception as e:
         print(f"❌ Failed to connect to Redis: {e}")
         return None
 
-# Singleton instance
+# Singleton instance (may be None if credentials are missing or connection failed)
 redis_client = get_redis_client()
+
+
+# Fix #13: Lazy reconnect — if redis_client dropped, re-initialize on next call.
+# This prevents a one-time Redis blip from permanently disabling caching.
+def get_redis():
+    """Return the active Redis client, reconnecting if needed."""
+    global redis_client
+    if redis_client is None:
+        redis_client = get_redis_client()
+    return redis_client

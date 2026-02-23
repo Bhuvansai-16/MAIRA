@@ -21,12 +21,12 @@ from psycopg.rows import dict_row
 load_dotenv()
 
 try:
-    from ..redis_client import redis_client
+    from ..redis_client import get_redis
 except ImportError:
     # Handle direct execution or different path structure
     import sys
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from redis_client import redis_client
+    from redis_client import get_redis
 
 # =====================================================
 # SUPABASE CONNECTION CONFIG
@@ -54,11 +54,11 @@ DB_URI = (
 # =====================================================
 POOL_CONFIG = dict(
     conninfo=DB_URI,
-    min_size=2,          # Increased from 1
-    max_size=15,         # INCREASED from 2
+    min_size=1,          # Fix #1: right-sized for Supabase free-tier
+    max_size=5,          # Fix #1: was 15, reduces connection pressure
     open=False,
-    max_idle=45,            # Close idle connections after 45s (was 60)
-    max_lifetime=240,       # Recycle every 4 min (was 5 min)
+    max_idle=45,            # Close idle connections after 45s
+    max_lifetime=240,       # Recycle every 4 min
     reconnect_timeout=30,
     num_workers=2,
     check=ConnectionPool.check_connection,
@@ -73,8 +73,8 @@ pool = ConnectionPool(**POOL_CONFIG)
 # Well within Supabase free-tier ~20 connection limit
 CHECKPOINTER_POOL_CONFIG = dict(
     conninfo=DB_URI,
-    min_size=2,          # Increased from 1
-    max_size=15,         # INCREASED from 2
+    min_size=1,          # Fix #1: right-sized for Supabase free-tier
+    max_size=5,          # Fix #1: was 15, reduces connection pressure
     open=False,
     max_idle=15,            # Close idle after 15s — faster SSL recycle
     max_lifetime=90,        # Recycle every 90s — prevent stale SSL sessions
@@ -97,12 +97,39 @@ _fallback_checkpointer = None
 # (must be defined before functions that use @with_db_retry)
 # =====================================================
 
+def run_migrations():
+    """
+    Run one-time schema migrations at startup.
+    Fix #5: moved out of get_store() hot path — only runs once.
+    """
+    try:
+        with _checkpointer_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    ALTER TABLE public.store
+                    ADD COLUMN IF NOT EXISTS ttl_minutes INTEGER DEFAULT NULL
+                """)
+                cur.execute("""
+                    ALTER TABLE public.store
+                    ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ DEFAULT NULL
+                """)
+                cur.execute("""
+                    ALTER TABLE public.store
+                    ADD COLUMN IF NOT EXISTS namespace TEXT DEFAULT ''
+                """)
+            conn.commit()
+            print("✅ Migrations complete")
+    except Exception as e:
+        print(f"⚠️ Migrations skipped (table may not exist yet): {e}")
+
+
 def open_all_pools():
-    """ Open both pools. Safe to call multiple times. """
+    """ Open both pools and run startup migrations. Safe to call multiple times. """
     if pool.closed:
         pool.open()
     if _checkpointer_pool.closed:
         _checkpointer_pool.open()
+    run_migrations()  # Fix #5: run migrations once at startup
     print("✅ All PostgreSQL connection pools opened")
 
 
@@ -215,7 +242,9 @@ def _is_transient_error(error_msg: str) -> bool:
         # Connection errors
         "server closed", "broken pipe", "connection reset",
         "no connection", "could not connect", "connection refused",
-        "connection timed out", "network", "timeout",
+        "connection timed out",
+        "network error", "network timeout",  # Fix #9: narrower than bare "network"
+        "query timed out", "statement timeout",  # Fix #9: narrower than bare "timeout"
         "connection unexpectedly closed", "server unexpectedly closed",
         # Pool errors
         "pool is closed", "pool exhausted", "connection is closed",
@@ -292,6 +321,7 @@ def get_store():
     """
     Returns a persistent store for long-term memory.
     Uses the dedicated checkpointer pool (never reset during streaming).
+    Fix #5: schema migrations moved to run_migrations() / open_all_pools().
     """
     global _checkpointer_pool
     
@@ -302,35 +332,6 @@ def get_store():
         
     from langgraph.store.postgres import PostgresStore
     store = PostgresStore(_checkpointer_pool)
-    
-    # Auto-fix store table schema - add missing columns if needed
-    try:
-        with _checkpointer_pool.connection() as conn:
-            with conn.cursor() as cur:
-                # Add ttl_minutes column if missing
-                cur.execute("""
-                    ALTER TABLE public.store 
-                    ADD COLUMN IF NOT EXISTS ttl_minutes INTEGER DEFAULT NULL
-                """)
-                
-                # Add expires_at column if missing
-                cur.execute("""
-                    ALTER TABLE public.store 
-                    ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ DEFAULT NULL
-                """)
-                
-                # Add namespace column if missing (sometimes used instead of prefix)
-                cur.execute("""
-                    ALTER TABLE public.store 
-                    ADD COLUMN IF NOT EXISTS namespace TEXT DEFAULT ''
-                """)
-                
-                conn.commit()
-                print("✅ Store table schema verified/updated with all required columns")
-    except Exception as e:
-        print(f"⚠️ Could not update store table schema: {e}")
-        print("   The agent will still work but long-term memory may be limited")
-    
     return store
 
 
@@ -689,10 +690,11 @@ def create_custom_persona(user_id: str, name: str, instructions: str) -> dict | 
         print(f"⚠️ Error creating custom persona: {e}")
         return None
     finally:
-        # Invalidate cache safely
-        if redis_client:
+        # Invalidate cache safely (Fix #13: use get_redis() for lazy reconnect)
+        _redis = get_redis()
+        if _redis:
             try:
-                redis_client.delete(f"personas:{user_id}")
+                _redis.delete(f"personas:{user_id}")
             except Exception as e:
                 print(f"⚠️ Cache invalidation failed: {e}")
 
@@ -703,11 +705,12 @@ def get_custom_personas(user_id: str) -> list[dict]:
     Get all active custom personas for a user.
     Returns list of persona dicts sorted by creation time.
     """
-    # 1. Check Redis cache
+    # 1. Check Redis cache (Fix #13: use get_redis() for lazy reconnect)
     cache_key = f"personas:{user_id}"
-    if redis_client:
+    _redis = get_redis()
+    if _redis:
         try:
-            cached = redis_client.get(cache_key)
+            cached = _redis.get(cache_key)
             if cached:
                 print(f"⚡ Cache HIT for personas: {user_id}")
                 return json.loads(cached)
@@ -737,10 +740,11 @@ def get_custom_personas(user_id: str) -> list[dict]:
                     })
                 print(f"👤 Found {len(personas)} custom personas for user {user_id}")
                 
-                # 2. Cache results
-                if redis_client:
+                # 2. Cache results (Fix #13: use get_redis() for lazy reconnect)
+                _redis = get_redis()
+                if _redis:
                     try:
-                        redis_client.setex(cache_key, 3600, json.dumps(personas))
+                        _redis.setex(cache_key, 3600, json.dumps(personas))
                     except Exception as e:
                         print(f"⚠️ Failed to cache personas: {e}")
                 
@@ -750,7 +754,7 @@ def get_custom_personas(user_id: str) -> list[dict]:
         return []
 
 
-@with_db_retry()
+@with_db_retry()  # Fix #3: was missing retry decorator
 def update_custom_persona(persona_id: str, user_id: str, name: str = None, instructions: str = None) -> bool:
     """
     Update a custom persona's name and/or instructions.
@@ -789,10 +793,11 @@ def update_custom_persona(persona_id: str, user_id: str, name: str = None, instr
         print(f"⚠️ Error updating custom persona: {e}")
         return False
     finally:
-        # Invalidate cache safely
-        if redis_client:
+        # Invalidate cache safely (Fix #13: use get_redis() for lazy reconnect)
+        _redis = get_redis()
+        if _redis:
             try:
-                redis_client.delete(f"personas:{user_id}")
+                _redis.delete(f"personas:{user_id}")
             except Exception as e:
                 print(f"⚠️ Cache invalidation failed: {e}")
 
@@ -825,10 +830,11 @@ def delete_custom_persona(persona_id: str, user_id: str) -> bool:
         print(f"⚠️ Error deleting custom persona: {e}")
         return False
     finally:
-        # Invalidate cache safely
-        if redis_client:
+        # Invalidate cache safely (Fix #13: use get_redis() for lazy reconnect)
+        _redis = get_redis()
+        if _redis:
             try:
-                redis_client.delete(f"personas:{user_id}")
+                _redis.delete(f"personas:{user_id}")
             except Exception as e:
                 print(f"⚠️ Cache invalidation failed: {e}")
 
@@ -843,11 +849,12 @@ def get_user_sites(user_id: str) -> list[str]:
     Get all saved sites for a user.
     Returns a list of URL strings.
     """
-    # 1. Check Redis cache
+    # 1. Check Redis cache (Fix #13: use get_redis() for lazy reconnect)
     cache_key = f"sites:{user_id}"
-    if redis_client:
+    _redis = get_redis()
+    if _redis:
         try:
-            cached = redis_client.get(cache_key)
+            cached = _redis.get(cache_key)
             if cached:
                 print(f"⚡ Cache HIT for sites: {user_id}")
                 return json.loads(cached)
@@ -869,10 +876,11 @@ def get_user_sites(user_id: str) -> list[str]:
                 sites = [row[0] for row in rows]
                 print(f"🌐 Found {len(sites)} saved sites for user {user_id}")
                 
-                # 2. Cache results
-                if redis_client:
+                # 2. Cache results (Fix #13: use get_redis() for lazy reconnect)
+                _redis = get_redis()
+                if _redis:
                     try:
-                        redis_client.setex(cache_key, 3600, json.dumps(sites))
+                        _redis.setex(cache_key, 3600, json.dumps(sites))
                     except Exception as e:
                         print(f"⚠️ Failed to cache sites: {e}")
                 
@@ -914,10 +922,11 @@ def set_user_sites(user_id: str, urls: list[str]) -> bool:
         print(f"⚠️ Error saving user sites: {e}")
         return False
     finally:
-        # Invalidate cache safely
-        if redis_client:
+        # Invalidate cache safely (Fix #13: use get_redis() for lazy reconnect)
+        _redis = get_redis()
+        if _redis:
             try:
-                redis_client.delete(f"sites:{user_id}")
+                _redis.delete(f"sites:{user_id}")
             except Exception as e:
                 print(f"⚠️ Cache invalidation failed: {e}")
 
@@ -944,10 +953,11 @@ def add_user_site(user_id: str, url: str) -> bool:
         print(f"⚠️ Error adding user site: {e}")
         return False
     finally:
-        # Invalidate cache safely
-        if redis_client:
+        # Invalidate cache safely (Fix #13: use get_redis() for lazy reconnect)
+        _redis = get_redis()
+        if _redis:
             try:
-                redis_client.delete(f"sites:{user_id}")
+                _redis.delete(f"sites:{user_id}")
             except Exception as e:
                 print(f"⚠️ Cache invalidation failed: {e}")
 
@@ -973,10 +983,11 @@ def remove_user_site(user_id: str, url: str) -> bool:
         print(f"⚠️ Error removing user site: {e}")
         return False
     finally:
-        # Invalidate cache safely
-        if redis_client:
+        # Invalidate cache safely (Fix #13: use get_redis() for lazy reconnect)
+        _redis = get_redis()
+        if _redis:
             try:
-                redis_client.delete(f"sites:{user_id}")
+                _redis.delete(f"sites:{user_id}")
             except Exception as e:
                 print(f"⚠️ Cache invalidation failed: {e}")
 

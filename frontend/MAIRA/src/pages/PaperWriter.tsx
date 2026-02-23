@@ -10,10 +10,8 @@ import {
   ChevronLeft,
   X,
   Send,
-  Sparkles,
   RefreshCw,
   Download,
-  Wand2,
   PanelRightOpen,
   PanelLeftOpen,
   ArrowLeft,
@@ -24,6 +22,7 @@ import {
   Eye,
   EyeOff,
   Layout,
+  Shield,
 } from 'lucide-react';
 import { useTheme } from '../context/ThemeContext';
 import { toast } from 'sonner';
@@ -102,8 +101,12 @@ Interpretation and implications.
 \\section{Conclusion}
 Summary and future work.
 
-\\bibliographystyle{plainnat}
-\\bibliography{references} % your .bib file
+\\begin{thebibliography}{99}
+\\bibitem{ref1}
+Author, A. (Year). Title of the paper. \\textit{Journal Name}, Vol(Issue), Page Numbers.
+\\bibitem{ref2}
+Author, B. (Year). \\textit{Title of the Book}. Publisher Name.
+\\end{thebibliography}
 
 \\end{document}`,
   },
@@ -165,8 +168,10 @@ Summary and future work.
 % Balance columns on last page (recommended for IEEE)
 \\balance
 
-\\bibliographystyle{IEEEtran}
-\\bibliography{references} % Use your .bib file here
+\\begin{thebibliography}{00}
+\\bibitem{b1} G. Eason, B. Noble, and I. N. Sneddon, \`\`On certain integrals of Lipschitz-Hankel type involving products of Bessel functions,'' Phil. Trans. Roy. Soc. London, vol. A247, pp. 529--551, April 1955.
+\\bibitem{b2} J. Clerk Maxwell, A Treatise on Electricity and Magnetism, 3rd ed., vol. 2. Oxford: Clarendon, 1892, pp.68--73.
+\\end{thebibliography}
 
 \\end{document}`,
   },
@@ -218,8 +223,9 @@ Data1 & Data2 & Data3 \\\\
 Continue your chapter...
 
 % Optional per-chapter bibliography
-%\\bibliographystyle{plain}
-%\\bibliography{references}
+%\\begin{thebibliography}{99}
+%\\bibitem{ref1} ...
+%\\end{thebibliography}
 
 \\end{document}`,
   },
@@ -283,12 +289,12 @@ function parseOutline(latex: string): OutlineItem[] {
 }
 
 // ─── Simple LaTeX to HTML preview ──────────────────────
-function renderPreview(latex: string): string {
+function renderPreview(latex: string, files: PaperFile[] = []): string[] {
   let html = latex;
 
   // Extract title, author, date
-  const titleMatch = html.match(/\\title\{([^}]+)\}/);
-  const authorMatch = html.match(/\\author\{([^}]*(?:\{[^}]*\}[^}]*)*)\}/s);
+  const titleMatch = html.match(/\\title\{((?:[^{}]|\{[^{}]*\})*)\}/);
+  const authorMatch = html.match(/\\author\{((?:[^{}]|\{[^{}]*\})*)\}/s);
 
   // Remove preamble (everything before \begin{document})
   const beginDoc = html.indexOf('\\begin{document}');
@@ -325,9 +331,9 @@ function renderPreview(latex: string): string {
         .replace(/\\small\s*/g, '')
         .replace(/\\textit\{([^}]+)\}/g, '$1')
         .replace(/\\textsuperscript\{[^}]*\}/g, '')
-        .replace(/\\IEEEauthorblockN\{([^}]+)\}/g, '<strong>$1</strong>')
-        .replace(/\\IEEEauthorblockA\{([^}]*(?:\{[^}]*\}[^}]*)*)\}/gs, (_, inner) => {
-          const cleaned = inner.replace(/\\textit\{([^}]+)\}/g, '$1').replace(/\\\\/g, ', ').replace(/\s+/g, ' ').trim();
+        .replace(/\\IEEEauthorblockN\{((?:[^{}]|\{[^{}]*\})*)\}/g, '<strong>$1</strong>')
+        .replace(/\\IEEEauthorblockA\{((?:[^{}]|\{[^{}]*\})*)\}/gs, (_, inner) => {
+          const cleaned = inner.replace(/\\textit\{((?:[^{}]|\{[^{}]*\})*)\}/g, '$1').replace(/\\\\/g, ', ').replace(/\s+/g, ' ').trim();
           return `<span style="font-size:9pt;color:#666;">${cleaned}</span>`;
         })
         .replace(/\\and/g, ' &nbsp;&nbsp; ')
@@ -419,11 +425,41 @@ function renderPreview(latex: string): string {
     });
 
   // Lists
-  html = html.replace(/\\begin\{enumerate\}/g, '<ol>');
-  html = html.replace(/\\end\{enumerate\}/g, '</ol>');
-  html = html.replace(/\\begin\{itemize\}/g, '<ul>');
-  html = html.replace(/\\end\{itemize\}/g, '</ul>');
-  html = html.replace(/\\item\s*(.*)/g, '<li>$1</li>');
+  const parseItems = (body: string) => {
+    // Split by \item but keep the optional brackets if any
+    const items = body.split(/\\item(?:\s*\[[^\]]*\])?/).filter((s: string) => s.trim());
+    return items.map((i: string) => `<li>${i.trim()}</li>`).join('');
+  };
+
+  html = html.replace(/\\begin\{enumerate\}([\s\S]*?)\\end\{enumerate\}/g, (_, body) => {
+    return '<ol>' + parseItems(body) + '</ol>';
+  });
+  html = html.replace(/\\begin\{itemize\}([\s\S]*?)\\end\{itemize\}/g, (_, body) => {
+    return '<ul>' + parseItems(body) + '</ul>';
+  });
+
+  // Quotes
+  html = html.replace(/\\begin\{quote\}([\s\S]*?)\\end\{quote\}/g,
+    '<blockquote style="border-left: 3px solid #ddd; padding-left: 16px; margin: 16px 0; font-style: italic; color: #555;">$1</blockquote>');
+
+  // Links
+  html = html.replace(/\\href\{((?:[^{}]|\{[^{}]*\})*)\}\{((?:[^{}]|\{[^{}]*\})*)\}/g, (_, url, label) => {
+    const absoluteUrl = url.match(/^(?:[a-z+]+:)?\/\//i) || url.startsWith('mailto:') ? url : `https://${url}`;
+    return `<a href="${absoluteUrl}" target="_blank" style="color:#7c3aed;text-decoration:none;">${label}</a>`;
+  });
+  html = html.replace(/\\url\{((?:[^{}]|\{[^{}]*\})*)\}/g, (_, url) => {
+    const absoluteUrl = url.match(/^(?:[a-z+]+:)?\/\//i) || url.startsWith('mailto:') ? url : `https://${url}`;
+    return `<a href="${absoluteUrl}" target="_blank" style="color:#7c3aed;text-decoration:none;">${url}</a>`;
+  });
+
+  // Images
+  html = html.replace(/\\includegraphics(?:\[[^\]]*\])?\{([^}]*)\}/g, (_, filename) => {
+    const imgFile = files.find(f => f.name === filename || f.id === filename);
+    if (imgFile && imgFile.type === 'image') {
+      return `\n\n<div class="pw-preview-image"><img src="${imgFile.content}" alt="${filename}" /></div>\n\n`;
+    }
+    return `\n\n<div class="pw-preview-image-missing">Image not found: ${filename}</div>\n\n`;
+  });
 
   // Labels and refs
   html = html.replace(/\\label\{[^}]+\}/g, '');
@@ -445,9 +481,13 @@ function renderPreview(latex: string): string {
   html = html.replace(/\\renewcommand\{[^}]+\}\{[^}]*\}/g, '');
   html = html.replace(/\\def\\[^\n]+/g, '');
   html = html.replace(/\\IEEEoverridecommandlockouts/g, '');
-  html = html.replace(/\\newpage/g, '<hr style="border:none;border-top:1px dashed #ddd;margin:24px 0;">');
+  html = html.replace(/\\newpage/g, '<!-- PAGE_BREAK -->');
   html = html.replace(/\\footnotesize/g, '');
   html = html.replace(/\\centering/g, '');
+
+  // Final cleanup: Remove any remaining \command{...} or \command that didn't get handled
+  html = html.replace(/\\(?:[a-zA-Z]+)\*?\{((?:[^{}]|\{[^{}]*\})*)\}/g, '$1');
+  html = html.replace(/\\(?:[a-zA-Z]+)\*?/g, '');
 
   // Convert double newlines to paragraphs
   const paragraphs = html.split(/\n\n+/);
@@ -461,6 +501,7 @@ function renderPreview(latex: string): string {
         trimmed.startsWith('<ol') ||
         trimmed.startsWith('<ul') ||
         trimmed.startsWith('<table') ||
+        trimmed.startsWith('<blockquote') ||
         trimmed.startsWith('<p ') ||
         trimmed.startsWith('<hr') ||
         trimmed.startsWith('<li')
@@ -475,7 +516,9 @@ function renderPreview(latex: string): string {
   html = html.replace(/%[^\n]*/g, ''); // comments
   html = html.replace(/\\\\/g, '<br>');
 
-  return html;
+  // Split into pages
+  const pages = html.split('<!-- PAGE_BREAK -->').map(p => p.trim()).filter(p => p.length > 0);
+  return pages.length > 0 ? pages : ['<p style="color:#888; text-align:center; padding-top:40px;">Empty Document</p>'];
 }
 
 // ─── File interface ────────────────────────────────────
@@ -500,7 +543,12 @@ interface ChatMessage {
 export const PaperWriter = () => {
   // ── File state ──
   const [files, setFiles] = useState<PaperFile[]>([]);
+  const filesRef = useRef(files);
   const [activeFileId, setActiveFileId] = useState<string | null>(null);
+
+  useEffect(() => {
+    filesRef.current = files;
+  }, [files]);
   const [showNewFileModal, setShowNewFileModal] = useState(false);
   const [newFileName, setNewFileName] = useState('');
   const [showTemplates, setShowTemplates] = useState(true);
@@ -517,7 +565,7 @@ export const PaperWriter = () => {
   // ── Preview state ──
   const [previewCollapsed, setPreviewCollapsed] = useState(false);
   const [isCompiling, setIsCompiling] = useState(false);
-  const [previewHtml, setPreviewHtml] = useState('');
+  const [previewPages, setPreviewPages] = useState<string[]>([]);
 
   // ── Chat state ──
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
@@ -534,6 +582,12 @@ export const PaperWriter = () => {
   const [sidebarWidth, setSidebarWidth] = useState(300);
   const [previewWidth, setPreviewWidth] = useState(500);
   const [resizing, setResizing] = useState<'sidebar' | 'preview' | null>(null);
+  const [autoCompile, setAutoCompile] = useState(true);
+  const autoCompileRef = useRef(autoCompile);
+
+  useEffect(() => {
+    autoCompileRef.current = autoCompile;
+  }, [autoCompile]);
 
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
@@ -588,6 +642,8 @@ export const PaperWriter = () => {
   // ── Editor refs ──
   const editorContainerRef = useRef<HTMLDivElement>(null);
   const editorViewRef = useRef<EditorView | null>(null);
+  const chatInputRef = useRef<HTMLTextAreaElement>(null);
+  const imageUploadRef = useRef<HTMLInputElement>(null);
 
   const scrollToLine = useCallback((line: number) => {
     if (!editorViewRef.current) return;
@@ -615,6 +671,9 @@ export const PaperWriter = () => {
     let insert = '';
     let cursorOffset = 0;
 
+    const uploadedImages = files.filter(f => f.type === 'image');
+    const imageHint = uploadedImages.length > 0 ? uploadedImages[0].name : 'filename';
+
     switch (type) {
       case 'bold': insert = `\\textbf{${text}}`; cursorOffset = 8; break;
       case 'italic': insert = `\\textit{${text}}`; cursorOffset = 8; break;
@@ -625,8 +684,8 @@ export const PaperWriter = () => {
       case 'h2': insert = `\\subsection{${text}}`; cursorOffset = 12; break;
       case 'code': insert = `\\texttt{${text}}`; cursorOffset = 8; break;
       case 'link': insert = `\\href{url}{${text}}`; cursorOffset = 6; break;
-      case 'image': insert = `\\includegraphics[width=0.8\\textwidth]{filename}`; cursorOffset = 28; break;
-      case 'table': insert = `\\begin{table}[ht]\n  \\centering\n  \\begin{tabular}{c c}\n    A & B \\\\\n    C & D\n  \\end{tabular}\n  \\caption{Caption}\n  \\label{tab:my_label}\n\\end{table}`; cursorOffset = 0; break;
+      case 'image': insert = `\\includegraphics[width=0.8\\textwidth]{${imageHint}}`; cursorOffset = 28; break;
+      case 'table': insert = `\\begin{table}[ht] \n  \\centering \n  \\begin{tabular}{c c} \n    A & B \\\\ \n    C & D \n  \\end{tabular} \n  \\caption{Caption} \n  \\label{tab:my_label} \n\\end{table}`; cursorOffset = 0; break;
       default: return;
     }
 
@@ -708,11 +767,13 @@ export const PaperWriter = () => {
             );
             // Debounce compile
             if (compileTimeoutRef.current) clearTimeout(compileTimeoutRef.current);
-            setIsCompiling(true);
-            compileTimeoutRef.current = setTimeout(() => {
-              setPreviewHtml(renderPreview(newContent));
-              setIsCompiling(false);
-            }, 600);
+            if (autoCompileRef.current) {
+              setIsCompiling(true);
+              compileTimeoutRef.current = setTimeout(() => {
+                setPreviewPages(renderPreview(newContent, filesRef.current));
+                setIsCompiling(false);
+              }, 1000);
+            }
           }
         }),
         EditorView.theme({
@@ -745,7 +806,7 @@ export const PaperWriter = () => {
     lenisInstances.current.push(lenis);
 
     // Initial compile
-    setPreviewHtml(renderPreview(activeFile.content));
+    setPreviewPages(renderPreview(activeFile.content, filesRef.current));
 
     return () => {
       lenis.destroy();
@@ -807,6 +868,31 @@ export const PaperWriter = () => {
     [activeFileId, files]
   );
 
+  const handleImageUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!file.type.startsWith('image/')) {
+      toast.error("Please upload an image file");
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const base64 = event.target?.result as string;
+      const id = `img_${Date.now()}`;
+      const newFile: PaperFile = {
+        id,
+        name: file.name,
+        content: base64,
+        type: 'image',
+      };
+      setFiles((prev) => [...prev, newFile]);
+      toast.success(`Image ${file.name} uploaded`);
+    };
+    reader.readAsDataURL(file);
+  }, []);
+
   // ── Update editor content programmatically ──
   const updateEditorContent = useCallback((newContent: string) => {
     if (editorViewRef.current) {
@@ -825,8 +911,18 @@ export const PaperWriter = () => {
         f.id === activeFileId ? { ...f, content: newContent } : f
       )
     );
-    setPreviewHtml(renderPreview(newContent));
+    setPreviewPages(renderPreview(newContent, filesRef.current));
   }, [activeFileId]);
+
+  const handleManualCompile = useCallback(() => {
+    if (!activeFile) return;
+    setIsCompiling(true);
+    setTimeout(() => {
+      setPreviewPages(renderPreview(activeFile.content, filesRef.current));
+      setIsCompiling(false);
+      toast.success("Compiled successfully");
+    }, 400);
+  }, [activeFile]);
 
 
 
@@ -910,14 +1006,15 @@ export const PaperWriter = () => {
   }, [activeFile]);
 
   const exportToDocx = useCallback(async () => {
-    if (!previewHtml) {
+    if (previewPages.length === 0) {
       alert("No content to export. Please ensure the document is compiled.");
       return;
     }
 
     try {
+      const allHtml = previewPages.join(' ');
       const parser = new DOMParser();
-      const htmlDoc = parser.parseFromString(previewHtml, 'text/html');
+      const htmlDoc = parser.parseFromString(allHtml, 'text/html');
       const nodes = Array.from(htmlDoc.body.children);
 
       const docChildren: (docx.Paragraph | docx.Table)[] = [];
@@ -1060,7 +1157,7 @@ export const PaperWriter = () => {
       console.error("Export failed:", error);
       toast.error("Failed to export DOCX");
     }
-  }, [previewHtml, activeFile]);
+  }, [previewPages, activeFile]);
 
   // ── Export functions ──
   const exportFile = useCallback((format: 'tex' | 'copy' | 'pdf' | 'doc') => {
@@ -1117,8 +1214,8 @@ export const PaperWriter = () => {
         {/* Template selection */}
         <div className="pw-template-selection">
           <div style={{ textAlign: 'center', maxWidth: 560 }}>
-            <div className="pw-hero-icon">
-              <Sparkles size={32} color="#a78bfa" />
+            <div className="pw-hero-icon" style={{ background: 'rgba(124, 58, 237, 0.1)', border: '1px solid rgba(124, 58, 237, 0.2)' }}>
+              <Shield size={32} color="#a78bfa" />
             </div>
             <h1 className="pw-hero-title">Write Your Research Paper</h1>
             <p className="pw-hero-subtitle">
@@ -1332,10 +1429,24 @@ export const PaperWriter = () => {
             >
               <Plus size={16} />
             </button>
+            <button
+              className="pw-sidebar-icon-btn"
+              onClick={() => imageUploadRef.current?.click()}
+              title="Upload image"
+            >
+              <ImageIcon size={16} />
+            </button>
             <button className="pw-sidebar-icon-btn" title="Search">
               <Search size={16} />
             </button>
           </div>
+          <input
+            type="file"
+            ref={imageUploadRef}
+            style={{ display: 'none' }}
+            accept="image/*"
+            onChange={handleImageUpload}
+          />
 
           {/* Tabs */}
           <div className="pw-sidebar-tabs">
@@ -1366,7 +1477,11 @@ export const PaperWriter = () => {
                       setShowTemplates(false);
                     }}
                   >
-                    <File size={14} className="pw-file-icon" />
+                    {f.type === 'image' ? (
+                      <ImageIcon size={14} className="pw-file-icon" />
+                    ) : (
+                      <File size={14} className="pw-file-icon" />
+                    )}
                     <span style={{ flex: 1 }}>{f.name}</span>
                     <button
                       className="pw-sidebar-icon-btn"
@@ -1423,7 +1538,7 @@ export const PaperWriter = () => {
               <div className="pw-chat-messages">
                 {chatMessages.length === 0 ? (
                   <div style={{ padding: '40px 20px', textAlign: 'center', color: '#737373', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-                    <Sparkles size={24} style={{ marginBottom: 16, opacity: 0.4 }} />
+                    <Shield size={24} style={{ marginBottom: 16, opacity: 0.4, color: '#a78bfa' }} />
                     <p style={{ fontSize: 13, lineHeight: '1.5', margin: 0 }}>
                       Ask me to draft sections, edit text, or format your paper.
                     </p>
@@ -1433,7 +1548,7 @@ export const PaperWriter = () => {
                     <div key={msg.id} className={`pw-chat-msg ${msg.role}`}>
                       <div className="pw-chat-msg-text prose prose-invert prose-sm max-w-none">
                         <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {msg.text}
+                          {typeof msg.text === 'string' ? msg.text : JSON.stringify(msg.text)}
                         </ReactMarkdown>
                       </div>
                       {msg.role === 'ai' && msg.applied && msg.updatedLatex && (
@@ -1456,19 +1571,42 @@ export const PaperWriter = () => {
               </div>
               <div style={{ padding: 12, borderTop: '1px solid rgba(255,255,255,0.06)' }}>
                 <div className="pw-ai-input-wrapper" style={{ padding: '6px 10px' }}>
-                  <input
+                  <textarea
+                    ref={chatInputRef}
                     className="pw-ai-input"
                     placeholder="Ask AI..."
+                    rows={1}
                     value={chatInput}
-                    onChange={(e) => setChatInput(e.target.value)}
+                    onChange={(e) => {
+                      setChatInput(e.target.value);
+                      // Auto-resize
+                      e.target.style.height = 'auto';
+                      e.target.style.height = `${e.target.scrollHeight}px`;
+                    }}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter' && !e.shiftKey) {
                         e.preventDefault();
                         sendChatMessage();
+                        // Reset height
+                        if (chatInputRef.current) {
+                          chatInputRef.current.style.height = 'auto';
+                        }
                       }
                     }}
+                    style={{
+                      resize: 'none',
+                      maxHeight: '200px',
+                      overflowY: chatInput.split('\n').length > 5 ? 'auto' : 'hidden',
+                      paddingTop: '8px',
+                      paddingBottom: '8px'
+                    }}
                   />
-                  <button className="pw-sidebar-icon-btn" onClick={sendChatMessage}>
+                  <button className="pw-sidebar-icon-btn" onClick={() => {
+                    sendChatMessage();
+                    if (chatInputRef.current) {
+                      chatInputRef.current.style.height = 'auto';
+                    }
+                  }} style={{ alignSelf: 'flex-end', marginBottom: '4px' }}>
                     <Send size={14} />
                   </button>
                 </div>
@@ -1498,14 +1636,10 @@ export const PaperWriter = () => {
                 </span>
               </div>
             ))}
-            <button className="pw-editor-tools-btn" onClick={() => { setSidebarTab('chats'); setSidebarCollapsed(false); }}>
-              <Wand2 size={12} />
-              AI Tools
-            </button>
           </div>
 
           {/* ── Formatting Toolbar ── */}
-          {activeFile && (
+          {activeFile && activeFile.type === 'tex' && (
             <div className="pw-toolbar">
               <button onClick={() => insertFormat('bold')} title="Bold">
                 <Bold size={14} />
@@ -1548,7 +1682,14 @@ export const PaperWriter = () => {
 
           {/* Editor Body */}
           {activeFile ? (
-            <div className="pw-editor-body" ref={editorContainerRef} />
+            activeFile.type === 'image' ? (
+              <div className="pw-image-editor-preview">
+                <img src={activeFile.content} alt={activeFile.name} />
+                <p>{activeFile.name}</p>
+              </div>
+            ) : (
+              <div className="pw-editor-body" ref={editorContainerRef} />
+            )
           ) : (
             <div className="pw-empty-state">
               <div className="pw-empty-icon">
@@ -1601,18 +1742,42 @@ export const PaperWriter = () => {
                   <span className="pw-preview-page-info">Preview</span>
                 </div>
                 <div className="pw-preview-header-right">
-                  {/* Zoom toggle removed - Default is Zoom to fit */}
+                  <div className="pw-toggle-container">
+                    <span className="pw-toggle-label">Auto-Compile</span>
+                    <label className="pw-toggle">
+                      <input
+                        type="checkbox"
+                        checked={autoCompile}
+                        onChange={(e) => setAutoCompile(e.target.checked)}
+                      />
+                      <span className="pw-toggle-slider"></span>
+                    </label>
+                  </div>
+                  {!autoCompile && (
+                    <button
+                      className="pw-preview-icon-btn"
+                      onClick={handleManualCompile}
+                      title="Compile now"
+                      disabled={isCompiling}
+                    >
+                      <RefreshCw size={14} className={isCompiling ? 'animate-spin' : ''} />
+                    </button>
+                  )}
                 </div>
               </div>
 
               {/* Preview body - SCROLLABLE */}
               <div className="pw-preview-body" ref={previewBodyRef}>
                 {activeFile ? (
-                  <div
-                    className="pw-preview-page"
-                    dangerouslySetInnerHTML={{ __html: previewHtml }}
-                    style={{ width: '100%', maxWidth: 'none' }}
-                  />
+                  <div className="pw-preview-pages-container">
+                    {previewPages.map((pageHtml, idx) => (
+                      <div
+                        key={idx}
+                        className="pw-preview-page"
+                        dangerouslySetInnerHTML={{ __html: pageHtml }}
+                      />
+                    ))}
+                  </div>
                 ) : (
                   <div
                     style={{
@@ -1634,7 +1799,7 @@ export const PaperWriter = () => {
                 <button
                   className="pw-preview-action-btn"
                   title="Refresh preview"
-                  onClick={() => activeFile && setPreviewHtml(renderPreview(activeFile.content))}
+                  onClick={() => activeFile && setPreviewPages(renderPreview(activeFile.content, filesRef.current))}
                 >
                   <RefreshCw size={16} />
                 </button>

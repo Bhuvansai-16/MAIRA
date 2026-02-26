@@ -1,4 +1,4 @@
-# MAIRA — Multi-Agent Intelligent Research Assistant
+# MAIRA — Multi-Agent Intelligent Research Assistant for automated report generation
 
 MAIRA is an AI-powered deep research platform that orchestrates multiple specialized agents to perform comprehensive research, literature surveys, and professional report generation. It features a modern React chat interface with real-time SSE streaming, Supabase authentication, document uploads with RAG retrieval, GitHub repository analysis, and multi-model support across Google, Anthropic, Meta, and Moonshot providers.
 
